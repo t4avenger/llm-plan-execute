@@ -179,16 +179,18 @@ class CLIProvider(Provider):
 
 
 class ProviderRouter:
-    def __init__(self, providers: list[Provider]) -> None:
+    def __init__(self, providers: list[Provider], *, dry_run: bool = False, workspace: Path = Path(".")) -> None:
         self.providers = providers
+        self.dry_run = dry_run or any(isinstance(provider, DryRunProvider) for provider in providers)
+        self.workspace = workspace
 
     @classmethod
     def from_config(cls, config: AppConfig) -> ProviderRouter:
         if config.dry_run:
-            return cls([DryRunProvider()])
+            return cls([DryRunProvider()], dry_run=True, workspace=config.workspace)
         providers: list[Provider] = []
         providers.extend(CLIProvider(provider, workspace=config.workspace) for provider in config.providers)
-        return cls(providers)
+        return cls(providers, dry_run=False, workspace=config.workspace)
 
     def available_models(self) -> list[ModelInfo]:
         models: list[ModelInfo] = []

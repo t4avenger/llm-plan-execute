@@ -83,6 +83,8 @@ class RunState:
     created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     accepted_plan: str | None = None
     build_output: str | None = None
+    build_status: str | None = None
+    build_failure: str | None = None
     assignments: dict[str, ModelAssignment] = field(default_factory=dict)
     results: list[ProviderResult] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)

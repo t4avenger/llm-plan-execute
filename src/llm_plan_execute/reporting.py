@@ -9,6 +9,27 @@ def render_report(run: RunState) -> str:
     estimated_tokens = total_tokens - exact_tokens
     total_cost = sum(result.usage.cost_usd or 0 for result in run.results)
 
+    lines = _summary_lines(run, total_tokens, exact_tokens, estimated_tokens, total_cost)
+    for role, assignment in run.assignments.items():
+        reused = " reused" if assignment.reused else ""
+        lines.append(f"- `{role}`: `{assignment.model.id}` ({assignment.reason}{reused})")
+
+    _append_warnings(lines, run)
+    _append_clarification(lines, run)
+    _append_usage(lines, run)
+    _append_prompt_advice(lines)
+    _append_next_options(lines, run)
+
+    return "\n".join(lines) + "\n"
+
+
+def _summary_lines(
+    run: RunState,
+    total_tokens: int,
+    exact_tokens: int,
+    estimated_tokens: int,
+    total_cost: float,
+) -> list[str]:
     lines = [
         "# LLM Plan Execute Report",
         "",
@@ -16,24 +37,32 @@ def render_report(run: RunState) -> str:
         f"- Results: {len(run.results)} model calls",
         f"- Tokens: {total_tokens} total ({exact_tokens} exact, {estimated_tokens} estimated)",
         f"- Estimated cost: ${total_cost:.6f}",
-        "",
-        "## Model Assignments",
     ]
-    for role, assignment in run.assignments.items():
-        reused = " reused" if assignment.reused else ""
-        lines.append(f"- `{role}`: `{assignment.model.id}` ({assignment.reason}{reused})")
+    if run.build_status:
+        lines.append(f"- Build status: {run.build_status}")
+    if run.build_failure:
+        lines.append(f"- Build failure: {run.build_failure}")
+    lines.extend(["", "## Model Assignments"])
+    return lines
 
+
+def _append_warnings(lines: list[str], run: RunState) -> None:
     if run.warnings:
         lines.extend(["", "## Warnings"])
         lines.extend(f"- {warning}" for warning in run.warnings)
 
-    if run.clarification:
-        lines.extend(["", "## Clarification", f"- Status: {run.clarification.status}"])
-        if run.clarification.questions:
-            lines.append(f"- Questions: {len(run.clarification.questions)}")
-        if run.clarification.answers:
-            lines.append(f"- Answers: {len(run.clarification.answers)}")
 
+def _append_clarification(lines: list[str], run: RunState) -> None:
+    if not run.clarification:
+        return
+    lines.extend(["", "## Clarification", f"- Status: {run.clarification.status}"])
+    if run.clarification.questions:
+        lines.append(f"- Questions: {len(run.clarification.questions)}")
+    if run.clarification.answers:
+        lines.append(f"- Answers: {len(run.clarification.answers)}")
+
+
+def _append_usage(lines: list[str], run: RunState) -> None:
     lines.extend(["", "## Usage"])
     for result in run.results:
         exact = "exact" if result.usage.exact else result.usage.confidence
@@ -42,6 +71,8 @@ def render_report(run: RunState) -> str:
             f"{result.usage.total_tokens} tokens, ${result.usage.cost_usd or 0:.6f}, {exact}"
         )
 
+
+def _append_prompt_advice(lines: list[str]) -> None:
     lines.extend(
         [
             "",
@@ -53,8 +84,8 @@ def render_report(run: RunState) -> str:
         ]
     )
 
+
+def _append_next_options(lines: list[str], run: RunState) -> None:
     if run.next_options:
         lines.extend(["", "## Next Options"])
         lines.extend(f"- {option}" for option in run.next_options)
-
-    return "\n".join(lines) + "\n"

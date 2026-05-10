@@ -1,8 +1,16 @@
 import pytest
 
-from llm_plan_execute.providers import DryRunProvider, ProviderRouter
-from llm_plan_execute.types import ModelAssignment, ModelInfo, RunState
-from llm_plan_execute.workflow import accept_plan, complete_planning, run_build, run_clarification, run_planning
+from llm_plan_execute.providers import DryRunProvider, Provider, ProviderRouter
+from llm_plan_execute.types import ModelAssignment, ModelInfo, ProviderResult, RunState, Usage
+from llm_plan_execute.workflow import (
+    BuildFailedError,
+    _run_provider,
+    accept_plan,
+    complete_planning,
+    run_build,
+    run_clarification,
+    run_planning,
+)
 
 
 def test_dry_run_plan_build_report(tmp_path):
@@ -108,3 +116,95 @@ def test_build_fills_missing_assignments(tmp_path):
 
     assert "build_reviewer_a" in run.assignments
     assert any("Filled missing model assignments" in warning for warning in run.warnings)
+
+
+def test_builder_error_fails_build_and_skips_reviewers(tmp_path):
+    provider = RecordingBuildProvider(builder_error="provider failed")
+    router = ProviderRouter([provider], workspace=tmp_path)
+    run = _accepted_build_run(tmp_path)
+
+    with pytest.raises(BuildFailedError, match="provider failed") as exc:
+        run_build(run, router)
+
+    assert provider.calls == ["builder"]
+    assert exc.value.run.build_status == "failed"
+    assert exc.value.run.build_failure == "provider failed"
+    assert "Build Failure" in (run.run_dir / "05-build-output.md").read_text(encoding="utf-8")
+    assert not (run.run_dir / "06-build-review-a.md").exists()
+    assert "Build status: failed" in (run.run_dir / "report.md").read_text(encoding="utf-8")
+
+
+def test_noop_code_build_fails_and_skips_reviewers(tmp_path, monkeypatch):
+    provider = RecordingBuildProvider()
+    router = ProviderRouter([provider], workspace=tmp_path)
+    run = _accepted_build_run(tmp_path)
+    monkeypatch.setattr("llm_plan_execute.workflow._workspace_changes", lambda _workspace: "unchanged-diff")
+
+    with pytest.raises(BuildFailedError, match="without changing the workspace"):
+        run_build(run, router)
+
+    assert provider.calls == ["builder"]
+    assert run.build_status == "failed"
+    assert not (run.run_dir / "08-build-review-summary.md").exists()
+
+
+def test_dirty_workspace_with_changed_diff_does_not_fail_as_noop(tmp_path, monkeypatch):
+    provider = RecordingBuildProvider()
+    router = ProviderRouter([provider], workspace=tmp_path)
+    run = _accepted_build_run(tmp_path)
+    snapshots = iter(["dirty-before", "dirty-after"])
+    monkeypatch.setattr("llm_plan_execute.workflow._workspace_changes", lambda _workspace: next(snapshots))
+
+    run_build(run, router)
+
+    assert provider.calls == ["builder", "build_reviewer_a", "build_reviewer_b", "build_arbiter"]
+    assert run.build_status == "succeeded"
+
+
+def test_run_provider_emits_finish_progress_when_router_raises(tmp_path):
+    run = RunState.create("prompt", tmp_path)
+    model = ModelInfo("missing", "model")
+    events = []
+
+    def record(*event):
+        events.append(event)
+
+    with pytest.raises(ValueError, match="No provider can run"):
+        _run_provider(run, ProviderRouter([]), "builder", model, "prompt", record)
+
+    assert [event[0] for event in events] == ["start", "finish"]
+    assert events[1][4] is not None
+    assert events[1][4].error is not None
+
+
+def _accepted_build_run(tmp_path):
+    run = RunState.create("prompt", tmp_path / "runs")
+    run.accepted_plan = "Implement a code feature and add tests."
+    for role in (
+        "builder",
+        "build_reviewer_a",
+        "build_reviewer_b",
+        "build_arbiter",
+    ):
+        run.assignments[role] = ModelAssignment(role, ModelInfo("local", role, (role,)))
+    return run
+
+
+class RecordingBuildProvider(Provider):
+    def __init__(self, *, builder_error: str | None = None) -> None:
+        self.builder_error = builder_error
+        self.calls: list[str] = []
+
+    def available_models(self) -> list[ModelInfo]:
+        return [
+            ModelInfo("local", "builder", ("builder",)),
+            ModelInfo("local", "build_reviewer_a", ("build_reviewer_a",)),
+            ModelInfo("local", "build_reviewer_b", ("build_reviewer_b",)),
+            ModelInfo("local", "build_arbiter", ("build_arbiter",)),
+        ]
+
+    def run(self, role: str, model: ModelInfo, prompt: str) -> ProviderResult:
+        self.calls.append(role)
+        error = self.builder_error if role == "builder" else None
+        output = error or f"{role} output"
+        return ProviderResult(role, model, prompt, output, Usage(), 0.0, error)

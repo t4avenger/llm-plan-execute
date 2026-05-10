@@ -47,6 +47,8 @@ def write_state(run: RunState) -> Path:
             "prompt": run.prompt,
             "accepted_plan": run.accepted_plan,
             "build_output": run.build_output,
+            "build_status": run.build_status,
+            "build_failure": run.build_failure,
             "assignments": {role: assignment_to_dict(item) for role, item in run.assignments.items()},
             "results": [result_to_dict(result) for result in run.results],
             "warnings": run.warnings,

@@ -2,8 +2,10 @@ import json
 from pathlib import Path
 
 from llm_plan_execute.cli import _state_from_json, main
+from llm_plan_execute.config import sample_config
 
 CLARIFICATION_NEEDED_EXIT = 2
+CANCELED_EXIT = 130
 
 
 def _write_dry_config(tmp_path: Path) -> Path:
@@ -184,6 +186,32 @@ def test_config_validate_skips_missing_commands_in_dry_run(tmp_path, capsys, mon
     assert "was not found on PATH" not in captured.err
 
 
+def test_init_config_enables_installed_commands(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(
+        "llm_plan_execute.config.shutil.which",
+        lambda command: f"/bin/{command}" if command in {"codex", "cursor-agent"} else None,
+    )
+    config_path = tmp_path / "config.json"
+
+    exit_code = main(["init-config", "--path", str(config_path)])
+
+    captured = capsys.readouterr()
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    enabled = {provider["name"]: provider["enabled"] for provider in raw["providers"]}
+    assert exit_code == 0
+    assert f"Wrote {config_path}" in captured.out
+    assert enabled == {"codex": True, "claude": False, "cursor": True}
+
+
+def test_cursor_default_model_is_builder_only(monkeypatch):
+    monkeypatch.setattr("llm_plan_execute.config.shutil.which", lambda _command: "/bin/provider")
+
+    raw = sample_config()
+    cursor = next(provider for provider in raw["providers"] if provider["name"] == "cursor")
+
+    assert cursor["models"][0]["roles"] == ["builder"]
+
+
 def test_dry_run_allows_empty_provider_list(tmp_path, capsys):
     config = tmp_path / "config.json"
     config.write_text(
@@ -285,3 +313,70 @@ def test_build_unaccepted_run_reports_accept_guidance(tmp_path, capsys):
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "accept command" in captured.err
+
+
+def test_run_save_only_stops_before_build(tmp_path, capsys, monkeypatch):
+    config = _write_dry_config(tmp_path)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "save-only")
+
+    exit_code = main(["--config", str(config), "run", "--prompt", "Add a small feature", "--no-clarify"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Saved proposed plan." in captured.out
+    run_line = next(line for line in captured.out.splitlines() if line.startswith("Run:"))
+    run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
+    assert (run_dir / "04-proposed-plan.md").exists()
+    assert not (run_dir / "05-build-output.md").exists()
+
+
+def test_run_approve_builds_after_inline_plan_review(tmp_path, capsys, monkeypatch):
+    config = _write_dry_config(tmp_path)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "approve")
+
+    exit_code = main(["--config", str(config), "run", "--prompt", "Add a small feature", "--no-clarify"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "# Arbiter Decision" in captured.out
+    assert "Build output:" in captured.out
+    run_line = next(line for line in captured.out.splitlines() if line.startswith("Run:"))
+    run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
+    assert (run_dir / "08-build-review-summary.md").exists()
+
+
+def test_run_cancel_stops_before_build(tmp_path, capsys, monkeypatch):
+    config = _write_dry_config(tmp_path)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "cancel")
+
+    exit_code = main(["--config", str(config), "run", "--prompt", "Add a small feature", "--no-clarify"])
+
+    captured = capsys.readouterr()
+    assert exit_code == CANCELED_EXIT
+    assert "Canceled before build." in captured.out
+
+
+def test_quiet_suppresses_progress(tmp_path, capsys):
+    config = _write_dry_config(tmp_path)
+
+    exit_code = main(["--config", str(config), "--quiet", "plan", "--prompt", "Add a small feature", "--no-clarify"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Proposed plan:" in captured.out
+    assert captured.err == ""
+
+
+def test_progress_uses_stderr_and_leaves_stdout_clean(tmp_path, capsys):
+    config = _write_dry_config(tmp_path)
+
+    exit_code = main(["--config", str(config), "plan", "--prompt", "Add a small feature", "--no-clarify"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Proposed plan:" in captured.out
+    assert "planner: starting" in captured.err
+    assert "planner: starting" not in captured.out
