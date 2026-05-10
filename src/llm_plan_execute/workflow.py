@@ -275,6 +275,8 @@ def _run_provider(
             progress("finish", role, run, model, _failed_provider_result(role, model, prompt, exc), None)
         raise
     else:
+        if result.warning and result.warning not in run.warnings:
+            run.warnings.append(result.warning)
         if progress:
             progress("finish", role, run, model, result, None)
         return result

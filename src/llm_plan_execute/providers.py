@@ -91,6 +91,13 @@ class ProviderAdapter:
         raise NotImplementedError
 
 
+CURSOR_SANDBOX_UNAVAILABLE = "Sandbox mode is enabled but not available on this system"
+CURSOR_SANDBOX_RETRY_WARNING = (
+    "Cursor sandbox was unavailable on this system; retried without Cursor sandbox flags. "
+    "Cursor may run in allowlist or approval mode instead."
+)
+
+
 class CodexAdapter(ProviderAdapter):
     def build_command(
         self,
@@ -204,29 +211,30 @@ class CLIProvider(Provider):
         policy = execution_policy or ExecutionPolicy()
         provider_command = adapter.build_command(self.config, model, prompt, self.workspace, policy)
         try:
-            completed = subprocess.run(  # noqa: S603 - provider command is explicit user config, never a shell.
-                provider_command.args,
-                cwd=provider_command.cwd,
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=1800,
-            )
-            output = completed.stdout.strip()
-            stderr = completed.stderr.strip() or None
-            error = _process_error(completed.returncode, stderr)
-            if not output and stderr:
-                output = f"Provider returned no stdout. stderr:\n{stderr}"
-            elif not output and error:
-                output = f"Provider returned no stdout. {error}"
+            completed, warning = self._run_command_with_cursor_sandbox_fallback(provider_command)
+            output, error = _provider_output_and_error(completed)
             usage.output_tokens = estimate_tokens(output)
             usage.cost_usd = estimate_cost(model, usage)
-            return ProviderResult(role, model, prompt, output, usage, time.monotonic() - start, error)
+            return ProviderResult(role, model, prompt, output, usage, time.monotonic() - start, error, warning)
         except (OSError, subprocess.SubprocessError) as exc:
             output = f"Provider execution failed for {model.id}: {exc}"
             usage.output_tokens = estimate_tokens(output)
             usage.cost_usd = estimate_cost(model, usage)
             return ProviderResult(role, model, prompt, output, usage, time.monotonic() - start, str(exc))
+
+    def _run_command_with_cursor_sandbox_fallback(
+        self,
+        provider_command: ProviderCommand,
+    ) -> tuple[subprocess.CompletedProcess[str], str | None]:
+        completed = _run_provider_command(provider_command)
+        if not _should_retry_cursor_without_sandbox(self.config.name, provider_command.args, completed):
+            return completed, None
+
+        retry_command = ProviderCommand(_without_cursor_sandbox_args(provider_command.args), provider_command.cwd)
+        retry = _run_provider_command(retry_command)
+        if retry.returncode == 0 or retry.stdout.strip():
+            return retry, CURSOR_SANDBOX_RETRY_WARNING
+        return completed, None
 
 
 class ProviderRouter:
@@ -275,8 +283,56 @@ def _cursor_permission_args(policy: ExecutionPolicy) -> list[str]:
     if policy.mode == "full-access":
         return ["--force", "--sandbox", "disabled"]
     if policy.mode == "read-only":
-        return ["--mode", "plan", "--sandbox", "enabled"]
+        return ["--mode", "plan"]
     return []
+
+
+def _run_provider_command(provider_command: ProviderCommand) -> subprocess.CompletedProcess[str]:
+    # Provider command is explicit user config, never a shell.
+    return subprocess.run(  # noqa: S603
+        provider_command.args,
+        cwd=provider_command.cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=1800,
+    )
+
+
+def _provider_output_and_error(completed: subprocess.CompletedProcess[str]) -> tuple[str, str | None]:
+    output = completed.stdout.strip()
+    stderr = completed.stderr.strip() or None
+    error = _process_error(completed.returncode, stderr)
+    if not output and stderr:
+        output = f"Provider returned no stdout. stderr:\n{stderr}"
+    elif not output and error:
+        output = f"Provider returned no stdout. {error}"
+    return output, error
+
+
+def _should_retry_cursor_without_sandbox(
+    provider_name: str,
+    args: list[str],
+    completed: subprocess.CompletedProcess[str],
+) -> bool:
+    return (
+        provider_name == "cursor"
+        and "--sandbox" in args
+        and completed.returncode != 0
+        and CURSOR_SANDBOX_UNAVAILABLE in completed.stderr
+    )
+
+
+def _without_cursor_sandbox_args(args: list[str]) -> list[str]:
+    stripped: list[str] = []
+    index = 0
+    while index < len(args):
+        if args[index] == "--sandbox":
+            index += 2
+            continue
+        stripped.append(args[index])
+        index += 1
+    return stripped
 
 
 def _process_error(returncode: int, stderr: str | None) -> str | None:

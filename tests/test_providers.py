@@ -2,7 +2,15 @@ import subprocess
 from pathlib import Path
 
 from llm_plan_execute.config import ProviderConfig
-from llm_plan_execute.providers import ClaudeAdapter, CLIProvider, CodexAdapter, CursorAdapter, Provider, ProviderRouter
+from llm_plan_execute.providers import (
+    CURSOR_SANDBOX_RETRY_WARNING,
+    ClaudeAdapter,
+    CLIProvider,
+    CodexAdapter,
+    CursorAdapter,
+    Provider,
+    ProviderRouter,
+)
 from llm_plan_execute.types import ExecutionPolicy, ModelInfo, ProviderResult, Usage
 
 
@@ -130,8 +138,38 @@ def test_cursor_adapter_builds_read_only_command():
 
     assert "--mode" in command.args
     assert "plan" in command.args
-    assert "--sandbox" in command.args
-    assert "enabled" in command.args
+    assert "--sandbox" not in command.args
+
+
+def test_cursor_provider_retries_without_sandbox_when_system_sandbox_unavailable(monkeypatch):
+    model = ModelInfo("cursor", "auto")
+    provider = CLIProvider(ProviderConfig("cursor", "cursor-agent", True, (model,)))
+    calls: list[list[str]] = []
+
+    def fake_run(*args, **_kwargs):
+        command = args[0]
+        calls.append(command)
+        if "--sandbox" in command:
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout="",
+                stderr="Error: Sandbox mode is enabled but not available on this system.",
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("llm_plan_execute.providers.shutil.which", lambda command: f"/bin/{command}")
+    monkeypatch.setattr("llm_plan_execute.providers.subprocess.run", fake_run)
+
+    result = provider.run("builder", model, "build feature", ExecutionPolicy("full-access"))
+
+    assert result.output == "ok"
+    assert result.error is None
+    assert result.warning == CURSOR_SANDBOX_RETRY_WARNING
+    expected_call_count = 2
+    assert len(calls) == expected_call_count
+    assert "--sandbox" in calls[0]
+    assert "--sandbox" not in calls[1]
 
 
 def test_claude_adapter_builds_documented_extension_command():

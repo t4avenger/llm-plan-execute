@@ -10,8 +10,7 @@ from .types import (
     assignment_to_dict,
     clarification_to_dict,
     execution_policy_to_dict,
-    model_to_dict,
-    usage_to_dict,
+    provider_result_to_dict,
 )
 
 
@@ -34,15 +33,9 @@ def write_json(run: RunState, name: str, payload: dict[str, Any]) -> Path:
 
 
 def result_to_dict(result: ProviderResult) -> dict[str, Any]:
-    return {
-        "role": result.role,
-        "model": model_to_dict(result.model),
-        "prompt": result.prompt,
-        "output": result.output,
-        "usage": usage_to_dict(result.usage),
-        "elapsed_seconds": round(result.elapsed_seconds, 3),
-        "error": result.error,
-    }
+    item = provider_result_to_dict(result)
+    item["elapsed_seconds"] = round(result.elapsed_seconds, 3)
+    return item
 
 
 def write_state(run: RunState) -> Path:

@@ -206,6 +206,18 @@ def test_run_provider_emits_finish_progress_when_router_raises(tmp_path):
     assert events[1][4].error is not None
 
 
+def test_provider_warning_is_recorded_on_run(tmp_path):
+    model = ModelInfo("cursor", "auto")
+    provider = WarningProvider(model)
+    router = ProviderRouter([provider], workspace=tmp_path)
+    run = RunState.create("prompt", tmp_path)
+
+    result = _run_provider(run, router, "builder", model, "prompt", ExecutionPolicy(), None)
+
+    assert result.warning == "warning text"
+    assert run.warnings == ["warning text"]
+
+
 def _accepted_build_run(tmp_path):
     run = RunState.create("prompt", tmp_path / "runs")
     run.accepted_plan = "Implement a code feature and add tests."
@@ -246,3 +258,20 @@ class RecordingBuildProvider(Provider):
         error = self.builder_error if role == "builder" else None
         output = error or f"{role} output"
         return ProviderResult(role, model, prompt, output, Usage(), 0.0, error)
+
+
+class WarningProvider(Provider):
+    def __init__(self, model: ModelInfo) -> None:
+        self.model = model
+
+    def available_models(self) -> list[ModelInfo]:
+        return [self.model]
+
+    def run(
+        self,
+        role: str,
+        model: ModelInfo,
+        prompt: str,
+        _execution_policy: ExecutionPolicy | None = None,
+    ) -> ProviderResult:
+        return ProviderResult(role, model, prompt, "ok", Usage(), 0.0, warning="warning text")

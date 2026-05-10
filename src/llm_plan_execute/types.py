@@ -65,6 +65,7 @@ class ProviderResult:
     usage: Usage
     elapsed_seconds: float
     error: str | None = None
+    warning: str | None = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +138,21 @@ def usage_to_dict(usage: Usage) -> dict[str, Any]:
         "exact": usage.exact,
         "confidence": usage.confidence,
     }
+
+
+def provider_result_to_dict(result: ProviderResult) -> dict[str, Any]:
+    item = {
+        "role": result.role,
+        "model": model_to_dict(result.model),
+        "prompt": result.prompt,
+        "output": result.output,
+        "usage": usage_to_dict(result.usage),
+        "elapsed_seconds": result.elapsed_seconds,
+        "error": result.error,
+    }
+    if result.warning:
+        item["warning"] = result.warning
+    return item
 
 
 def clarification_to_dict(clarification: Clarification) -> dict[str, Any]:
