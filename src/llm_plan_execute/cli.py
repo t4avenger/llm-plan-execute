@@ -8,21 +8,20 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .artifacts import load_state, write_state, write_text
+from .artifacts import load_state
 from .config import (
     DEFAULT_CONFIG,
     AppConfig,
     ConfigIssue,
     ConfigValidation,
-    ExecutionConfig,
     format_validation,
     load_config,
-    normalize_writable_dirs,
     resolve_repo,
     resolve_workspace_relative_path,
     validate_config_file,
     write_sample_config,
 )
+from .interactive import InteractiveCanceledError, InteractiveSession
 from .providers import ProviderRouter
 from .reporting import render_report
 from .selection import assign_models
@@ -36,15 +35,17 @@ from .types import (
     RunState,
     Usage,
 )
-from .workflow import (
-    BuildFailedError,
-    accept_plan,
-    complete_planning,
-    render_clarification,
-    run_build,
-    run_clarification,
-    run_planning,
+from .workflow import BuildFailedError, accept_plan, run_build, run_planning
+from .workflow_runner import (
+    finalize_completion_reports,
+    gate_stage_transition,
+    interactive_build_review_loop,
+    interactive_plan_review,
+    merge_execution_dirs,
+    orchestrate_clarification,
+    resolve_build_permission,
 )
+from .workflow_state import WorkflowState, load_workflow_state, save_workflow_state
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -60,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="Use simulated providers and models.")
     parser.add_argument("--quiet", action="store_true", help="Suppress progress output.")
     parser.add_argument("--verbose", action="store_true", help="Show provider error details in progress output.")
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Use deterministic defaults for menus (also implied when stdin is not a TTY).",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init-config", help="Write a sample local config.")
@@ -78,7 +84,12 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--no-clarify", action="store_true", help="Skip the clarification phase.")
     _add_permission_args(plan)
 
-    run = sub.add_parser("run", help="Plan, approve, build, review, and report in one interactive flow.")
+    run = sub.add_parser(
+        "run",
+        help="Plan, approve, build, review, and report in one interactive flow.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="If you pause before build, resume with:\n  llm-plan-execute build --run-dir <run-dir>",
+    )
     run.add_argument("--prompt", default=None)
     run.add_argument("--prompt-file", type=Path, default=None)
     run.add_argument("--no-clarify", action="store_true", help="Skip the clarification phase.")
@@ -87,7 +98,15 @@ def build_parser() -> argparse.ArgumentParser:
     accept = sub.add_parser("accept", help="Accept a reviewed proposed plan.")
     accept.add_argument("--run-dir", type=Path, required=True)
 
-    build = sub.add_parser("build", help="Run build and review from an accepted plan.")
+    build = sub.add_parser(
+        "build",
+        help="Run build and review from an accepted plan.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Loads workflow-state.json when present. After a paused `run`, continue from the same "
+            "--run-dir so persisted workflow history is kept."
+        ),
+    )
     build.add_argument("--run-dir", type=Path, required=True)
     _add_permission_args(build)
 
@@ -96,9 +115,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+PAUSED_EXIT_CODE = 3
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         return _run(argv)
+    except InteractiveCanceledError:
+        print("Workflow canceled.", file=sys.stderr)
+        return 130
     except (KeyError, OSError, TypeError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -219,14 +244,16 @@ def _cmd_models(router: ProviderRouter) -> int:
     return 0
 
 
-def _cmd_plan(
+def _plan_run_planning_phase(
     args: argparse.Namespace,
+    prompt: str,
     router: ProviderRouter,
     app_config: AppConfig,
+    execution,
     progress: ProgressReporter,
-) -> int:
-    prompt = _read_prompt(app_config.workspace, args.prompt, args.prompt_file)
-    execution = _execution_with_cli_dirs(app_config.workspace, app_config.execution, args.writable_dir)
+    wf: WorkflowState,
+    session: InteractiveSession,
+) -> RunState | int:
     if args.no_clarify:
         run = run_planning(
             prompt,
@@ -237,44 +264,254 @@ def _cmd_plan(
             permission_mode=args.permission_mode,
             progress=progress.update,
         )
-    else:
-        run = run_clarification(
+        wf.stage = "plan_review"
+        save_workflow_state(run.run_dir, wf)
+        if args.yes:
+            wf.touch_accepted_plan()
+            wf.lifecycle_status = "completed"
+            save_workflow_state(run.run_dir, wf)
+        return run
+    outcome = orchestrate_clarification(
+        prompt=prompt,
+        router=router,
+        runs_dir=app_config.runs_dir,
+        execution=execution,
+        permission_mode=args.permission_mode,
+        progress=progress.update,
+        session=session,
+        no_clarify=False,
+        wf=wf,
+    )
+    if isinstance(outcome, int):
+        return outcome
+    run = outcome
+    if args.yes:
+        accept_plan(run)
+        wf.touch_accepted_plan()
+        wf.lifecycle_status = "completed"
+        save_workflow_state(run.run_dir, wf)
+    return run
+
+
+def _plan_print_run_and_proposed_hints(
+    args: argparse.Namespace,
+    session: InteractiveSession,
+    run: RunState,
+) -> None:
+    print(f"Run: {run.run_id}")
+    if not (args.yes or session.non_interactive):
+        proposed_hint = run.run_dir / "04-proposed-plan.md"
+        if proposed_hint.exists():
+            print(f"Proposed plan: {proposed_hint}")
+            print(f"Accept with: llm-plan-execute accept --run-dir {run.run_dir}")
+
+
+def _plan_finish_accept_or_review(
+    args: argparse.Namespace,
+    session: InteractiveSession,
+    run: RunState,
+    wf: WorkflowState,
+    router: ProviderRouter,
+    execution,
+    progress: ProgressReporter,
+) -> int:
+    if args.yes or session.non_interactive:
+        if not args.yes and session.non_interactive:
+            accept_plan(run)
+            wf.touch_accepted_plan()
+            wf.lifecycle_status = "completed"
+            save_workflow_state(run.run_dir, wf)
+        print(f"Accepted plan: {run.run_dir / '04-accepted-plan.md'}")
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return 0
+    reviewed = interactive_plan_review(
+        session=session,
+        run=run,
+        router=router,
+        execution=execution,
+        permission_mode=args.permission_mode,
+        progress=progress.update,
+        wf=wf,
+    )
+    if reviewed is None:
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return 130
+    print(f"Accepted plan: {reviewed.run_dir / '04-accepted-plan.md'}")
+    print(f"Report: {reviewed.run_dir / 'report.md'}")
+    return 0
+
+
+def _cmd_plan(
+    args: argparse.Namespace,
+    router: ProviderRouter,
+    app_config: AppConfig,
+    progress: ProgressReporter,
+) -> int:
+    prompt = _read_prompt(app_config.workspace, args.prompt, args.prompt_file)
+    execution = merge_execution_dirs(app_config.workspace, app_config.execution, args.writable_dir)
+    session = InteractiveSession(non_interactive=args.non_interactive or not sys.stdin.isatty())
+    wf = WorkflowState()
+    planned = _plan_run_planning_phase(args, prompt, router, app_config, execution, progress, wf, session)
+    if isinstance(planned, int):
+        return planned
+    run = planned
+    _plan_print_run_and_proposed_hints(args, session, run)
+    return _plan_finish_accept_or_review(args, session, run, wf, router, execution, progress)
+
+
+def _run_planning_only(
+    args: argparse.Namespace,
+    prompt: str,
+    router: ProviderRouter,
+    app_config: AppConfig,
+    execution,
+    progress: ProgressReporter,
+    wf: WorkflowState,
+    session: InteractiveSession,
+) -> RunState | int:
+    if args.no_clarify:
+        run = run_planning(
             prompt,
             app_config.runs_dir,
             router,
+            auto_accept=False,
             execution=execution,
             permission_mode=args.permission_mode,
             progress=progress.update,
         )
-        clarification = run.clarification
-        if clarification and clarification.status == "needs_questions":
-            if not sys.stdin.isatty():
-                print(f"Run: {run.run_id}")
-                print(f"Clarification needed: {run.run_dir / '00-clarification.md'}")
-                print("Answer the questions and rerun planning, or use --no-clarify to plan with assumptions.")
-                print(f"Report: {run.run_dir / 'report.md'}")
-                return 2
-            clarification.answers = [_ask_question(question) for question in clarification.questions]
-            clarification.status = "clear"
-            write_text(run, "00-clarification.md", render_clarification(clarification))
-            write_state(run)
-            print(f"Clarification: answered {len(clarification.answers)} question(s).")
-        else:
-            print(f"Clarification: no questions required ({run.run_dir / '00-clarification.md'}).")
-        run = complete_planning(
+        wf.stage = "plan_review"
+        save_workflow_state(run.run_dir, wf)
+        return run
+    outcome = orchestrate_clarification(
+        prompt=prompt,
+        router=router,
+        runs_dir=app_config.runs_dir,
+        execution=execution,
+        permission_mode=args.permission_mode,
+        progress=progress.update,
+        session=session,
+        no_clarify=False,
+        wf=wf,
+    )
+    if isinstance(outcome, int):
+        return outcome
+    return outcome
+
+
+def _run_print_proposed_plan_banner(run: RunState) -> None:
+    proposed_path = run.run_dir / "04-proposed-plan.md"
+    if proposed_path.exists():
+        proposed_plan = proposed_path.read_text(encoding="utf-8")
+        print(f"Run: {run.run_id}")
+        print(f"Proposed plan: {proposed_path}")
+        print("")
+        print(proposed_plan.rstrip())
+        print("")
+    else:
+        print(f"Run: {run.run_id}")
+
+
+def _run_accept_plan_phase(
+    session: InteractiveSession,
+    run: RunState,
+    wf: WorkflowState,
+    router: ProviderRouter,
+    execution,
+    permission_mode: str | None,
+    progress: ProgressReporter,
+) -> RunState | int:
+    if session.non_interactive:
+        accept_plan(run)
+        wf.touch_accepted_plan()
+        wf.stage = "pre_build"
+        save_workflow_state(run.run_dir, wf)
+        return run
+    reviewed = interactive_plan_review(
+        session=session,
+        run=run,
+        router=router,
+        execution=execution,
+        permission_mode=permission_mode,
+        progress=progress.update,
+        wf=wf,
+    )
+    if reviewed is None:
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return 130
+    return reviewed
+
+
+def _run_gate_before_build(
+    session: InteractiveSession,
+    wf: WorkflowState,
+    run: RunState,
+) -> int | None:
+    if session.non_interactive:
+        return None
+    transition = gate_stage_transition(session=session, wf=wf, run=run)
+    if transition == "pause":
+        state_path = save_workflow_state(run.run_dir, wf)
+        print("Workflow paused; state preserved.")
+        print(f"Workflow state: {state_path}")
+        print(f"Continue with: llm-plan-execute build --run-dir {run.run_dir}")
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return PAUSED_EXIT_CODE
+    if transition == "cancel":
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return 130
+    return None
+
+
+def _run_build_review_completion(
+    args: argparse.Namespace,
+    session: InteractiveSession,
+    router: ProviderRouter,
+    app_config: AppConfig,
+    execution,
+    wf: WorkflowState,
+    run: RunState,
+    progress: ProgressReporter,
+) -> int:
+    build_permission = args.permission_mode or resolve_build_permission(execution.build_mode, session)
+    try:
+        run = run_build(
             run,
             router,
-            auto_accept=args.yes,
             execution=execution,
-            permission_mode=args.permission_mode,
+            permission_mode=build_permission,
             progress=progress.update,
+            runs_root=app_config.runs_dir,
         )
-    print(f"Run: {run.run_id}")
-    if args.yes:
-        print(f"Accepted plan: {run.run_dir / '04-accepted-plan.md'}")
-    else:
-        print(f"Proposed plan: {run.run_dir / '04-proposed-plan.md'}")
-        print(f"Accept with: llm-plan-execute accept --run-dir {run.run_dir}")
+    except BuildFailedError as exc:
+        run = exc.run
+        wf.lifecycle_status = "failed"
+        save_workflow_state(run.run_dir, wf)
+        print(f"Build failed: {run.run_dir / '05-build-output.md'}")
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return 1
+
+    wf.stage = "build_review"
+    save_workflow_state(run.run_dir, wf)
+    review_outcome = interactive_build_review_loop(
+        session=session,
+        run=run,
+        router=router,
+        execution=execution,
+        permission_mode=build_permission,
+        progress=progress.update,
+        wf=wf,
+    )
+    if review_outcome == "cancel":
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return 130
+
+    completion = finalize_completion_reports(session=session, run=run, wf=wf)
+    if completion == "cancel":
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return 130
+
+    print(f"Build output: {run.run_dir / '05-build-output.md'}")
+    print(f"Review summary: {run.run_dir / '08-build-review-summary.md'}")
     print(f"Report: {run.run_dir / 'report.md'}")
     return 0
 
@@ -286,86 +523,30 @@ def _cmd_run(
     progress: ProgressReporter,
 ) -> int:
     prompt = _read_prompt(app_config.workspace, args.prompt, args.prompt_file)
-    execution = _execution_with_cli_dirs(app_config.workspace, app_config.execution, args.writable_dir)
-    if args.no_clarify:
-        run = run_planning(
-            prompt,
-            app_config.runs_dir,
-            router,
-            auto_accept=False,
-            execution=execution,
-            permission_mode=args.permission_mode,
-            progress=progress.update,
-        )
-    else:
-        run = run_clarification(
-            prompt,
-            app_config.runs_dir,
-            router,
-            execution=execution,
-            permission_mode=args.permission_mode,
-            progress=progress.update,
-        )
-        clarification = run.clarification
-        if clarification and clarification.status == "needs_questions":
-            if not sys.stdin.isatty():
-                print(f"Run: {run.run_id}")
-                print(f"Clarification needed: {run.run_dir / '00-clarification.md'}")
-                print("Run requires an interactive terminal to answer clarification questions.")
-                print(f"Report: {run.run_dir / 'report.md'}")
-                return 2
-            clarification.answers = [_ask_question(question) for question in clarification.questions]
-            clarification.status = "clear"
-            write_text(run, "00-clarification.md", render_clarification(clarification))
-            write_state(run)
-            print(f"Clarification: answered {len(clarification.answers)} question(s).")
-        else:
-            print(f"Clarification: no questions required ({run.run_dir / '00-clarification.md'}).")
-        run = complete_planning(
-            run,
-            router,
-            auto_accept=False,
-            execution=execution,
-            permission_mode=args.permission_mode,
-            progress=progress.update,
-        )
-
-    proposed_path = run.run_dir / "04-proposed-plan.md"
-    proposed_plan = proposed_path.read_text(encoding="utf-8")
-    print(f"Run: {run.run_id}")
-    print(f"Proposed plan: {proposed_path}")
-    print("")
-    print(proposed_plan.rstrip())
-    print("")
-    decision, build_permission_mode = _run_approval_decision(args.permission_mode or execution.build_mode)
-    if decision == "cancel":
-        print(f"Canceled before build. Report: {run.run_dir / 'report.md'}")
-        return 130
-    if decision == "save-only":
-        print(f"Saved proposed plan. Accept later with: llm-plan-execute accept --run-dir {run.run_dir}")
-        print(f"Report: {run.run_dir / 'report.md'}")
-        return 0
-
-    run = accept_plan(run)
-    try:
-        run = run_build(
-            run,
-            router,
-            execution=execution,
-            permission_mode=build_permission_mode,
-            progress=progress.update,
-            runs_root=app_config.runs_dir,
-        )
-    except BuildFailedError as exc:
-        run = exc.run
-        print(f"Build failed: {run.run_dir / '05-build-output.md'}")
-        print(f"Report: {run.run_dir / 'report.md'}")
-        return 1
-    print(f"Build output: {run.run_dir / '05-build-output.md'}")
-    print(f"Review summary: {run.run_dir / '08-build-review-summary.md'}")
-    print(f"Report: {run.run_dir / 'report.md'}")
-    print("Next options: inspect the report, accept the build as-is, or return to planning with review feedback.")
-    return 0
+    execution = merge_execution_dirs(app_config.workspace, app_config.execution, args.writable_dir)
+    session = InteractiveSession(non_interactive=args.non_interactive or not sys.stdin.isatty())
+    wf = WorkflowState()
+    planned = _run_planning_only(args, prompt, router, app_config, execution, progress, wf, session)
+    if isinstance(planned, int):
+        return planned
+    run = planned
+    _run_print_proposed_plan_banner(run)
+    accepted = _run_accept_plan_phase(
+        session,
+        run,
+        wf,
+        router,
+        execution,
+        args.permission_mode,
+        progress,
+    )
+    if isinstance(accepted, int):
+        return accepted
+    run = accepted
+    early = _run_gate_before_build(session, wf, run)
+    if early is not None:
+        return early
+    return _run_build_review_completion(args, session, router, app_config, execution, wf, run, progress)
 
 
 def _cmd_accept(args: argparse.Namespace, app_config: AppConfig) -> int:
@@ -388,21 +569,65 @@ def _cmd_build(
     run_dir = resolve_workspace_relative_path(app_config.workspace, args.run_dir)
     raw = load_state(run_dir)
     run = _state_from_json(raw, run_dir)
-    execution = _execution_with_cli_dirs(app_config.workspace, app_config.execution, args.writable_dir)
+    execution = merge_execution_dirs(app_config.workspace, app_config.execution, args.writable_dir)
+    session = InteractiveSession(non_interactive=args.non_interactive or not sys.stdin.isatty())
+    wf = load_workflow_state(run.run_dir)
+    wf.stage = "pre_build"
+    save_workflow_state(run.run_dir, wf)
+
+    if session.non_interactive:
+        transition = "proceed"
+    else:
+        transition = gate_stage_transition(session=session, wf=wf, run=run)
+        if transition == "pause":
+            state_path = save_workflow_state(run.run_dir, wf)
+            print("Workflow paused before build; state preserved.")
+            print(f"Workflow state: {state_path}")
+            print(f"Continue with: llm-plan-execute build --run-dir {run.run_dir}")
+            print(f"Report: {run.run_dir / 'report.md'}")
+            return PAUSED_EXIT_CODE
+        if transition == "cancel":
+            print(f"Report: {run.run_dir / 'report.md'}")
+            return 130
+
+    build_permission = args.permission_mode or resolve_build_permission(execution.build_mode, session)
     try:
         run = run_build(
             run,
             router,
             execution=execution,
-            permission_mode=args.permission_mode,
+            permission_mode=build_permission,
             progress=progress.update,
             runs_root=app_config.runs_dir,
         )
     except BuildFailedError as exc:
         run = exc.run
+        wf.lifecycle_status = "failed"
+        save_workflow_state(run.run_dir, wf)
         print(f"Build failed: {run.run_dir / '05-build-output.md'}")
         print(f"Report: {run.run_dir / 'report.md'}")
         return 1
+
+    wf.stage = "build_review"
+    save_workflow_state(run.run_dir, wf)
+    review_outcome = interactive_build_review_loop(
+        session=session,
+        run=run,
+        router=router,
+        execution=execution,
+        permission_mode=build_permission,
+        progress=progress.update,
+        wf=wf,
+    )
+    if review_outcome == "cancel":
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return 130
+
+    completion = finalize_completion_reports(session=session, run=run, wf=wf)
+    if completion == "cancel":
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return 130
+
     print(f"Build output: {run.run_dir / '05-build-output.md'}")
     print(f"Review summary: {run.run_dir / '08-build-review-summary.md'}")
     print(f"Report: {run.run_dir / 'report.md'}")
@@ -423,7 +648,7 @@ def _read_prompt(workspace: Path, prompt: str | None, prompt_file: Path | None) 
     if prompt_file:
         path = resolve_workspace_relative_path(workspace, prompt_file)
         return path.read_text(encoding="utf-8")
-    raise SystemExit("Provide --prompt or --prompt-file.")
+    raise ValueError("Provide --prompt or --prompt-file.")
 
 
 def _assignment_json(assignments: dict[str, ModelAssignment]) -> dict[str, object]:
@@ -564,51 +789,6 @@ def _execution_policies_from_json(value: object) -> dict[str, ExecutionPolicy]:
             tuple(Path(path) for path in dirs if isinstance(path, str)),
         )
     return policies
-
-
-def _execution_with_cli_dirs(
-    workspace: Path,
-    execution: ExecutionConfig,
-    writable_dirs: list[Path],
-) -> ExecutionConfig:
-    if not writable_dirs:
-        return execution
-    extra = normalize_writable_dirs(workspace, tuple(writable_dirs), field="--writable-dir")
-    return ExecutionConfig(
-        default_mode=execution.default_mode,
-        planning_mode=execution.planning_mode,
-        review_mode=execution.review_mode,
-        build_mode=execution.build_mode,
-        writable_dirs=(*execution.writable_dirs, *extra),
-    )
-
-
-def _ask_question(question: str) -> str:
-    print(question)
-    return input("> ").strip()
-
-
-def _run_approval_decision(default_permission: str) -> tuple[str, str | None]:
-    if not sys.stdin.isatty():
-        return "save-only", None
-    while True:
-        answer = (
-            input(
-                "Approve plan? [approve/cancel/save-only/read-only/workspace-write/full-access] "
-                f"(permission default: {default_permission}) > "
-            )
-            .strip()
-            .lower()
-        )
-        if answer in {"approve", "a", "yes", "y", ""}:
-            return "approve", default_permission
-        if answer in {"cancel", "c", "no", "n"}:
-            return "cancel", None
-        if answer in {"save-only", "save", "s"}:
-            return "save-only", None
-        if answer in PERMISSION_MODES:
-            return "approve", answer
-        print("Enter approve, cancel, save-only, or a permission mode.")
 
 
 class ProgressReporter:
