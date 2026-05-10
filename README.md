@@ -20,14 +20,11 @@ uv sync --dev
 Run the workflow with simulated providers:
 
 ```bash
-uv run llm-plan-execute --dry-run models
-uv run llm-plan-execute --dry-run plan --prompt "Add a small feature"
-uv run llm-plan-execute --dry-run accept --run-dir .llm-plan-execute/runs/<run-id>
-uv run llm-plan-execute --dry-run build --run-dir .llm-plan-execute/runs/<run-id>
+uv run llm-plan-execute --dry-run run --prompt "Add a small feature"
 uv run llm-plan-execute --dry-run report --run-dir .llm-plan-execute/runs/<run-id>
 ```
 
-Dry-run mode is deterministic, completes quickly, and never shells out to provider CLIs. Use it only for validation and demos.
+The `run` command handles clarification, planning, plan review, arbitration, inline approval, build, build review, and reporting in one terminal flow. Dry-run mode is deterministic, completes quickly, and never shells out to provider CLIs. Use it only for validation and demos.
 
 Create a local provider config:
 
@@ -37,8 +34,9 @@ uv run llm-plan-execute config validate
 ```
 
 Provider configs live at `.llm-plan-execute/config.json` and are intentionally local.
+`init-config` enables provider entries whose configured command is found on `PATH` and disables missing commands. For example, a machine with `codex` and `cursor-agent` installed will enable Codex and Cursor, while leaving Claude disabled if `claude` is absent. Cursor's default model is builder-only unless you explicitly add planning or review roles.
 
-Normal CLI usage requires a config file. If `.llm-plan-execute/config.json` is missing, commands such as `models`, `plan`, and `build` fail with guidance to run `init-config`, pass `--config`, or opt into `--dry-run`.
+Normal CLI usage requires a config file. If `.llm-plan-execute/config.json` is missing, commands such as `models`, `run`, `plan`, and `build` fail with guidance to run `init-config`, pass `--config`, or opt into `--dry-run`.
 
 ## Provider Setup
 
@@ -105,7 +103,13 @@ Common failure modes:
 
 ## Workflow
 
-Planning first checks whether the request needs clarification. In an interactive terminal, `plan` asks those questions before drafting. In non-interactive use, it writes `00-clarification.md` and exits so the caller can provide a clearer prompt or rerun with `--no-clarify`.
+For interactive use, start with:
+
+```bash
+uv run llm-plan-execute run --prompt "Add a small feature"
+```
+
+Planning first checks whether the request needs clarification. In an interactive terminal, `run` and `plan` ask those questions before drafting. In non-interactive use, they write `00-clarification.md` and exit so the caller can provide a clearer prompt or rerun with `--no-clarify`.
 
 After clarification, planning uses one planning model, two independent reviewer models, and an arbiter model. By default, the arbiter output is written as `04-proposed-plan.md` for review. Accept that exact reviewed plan with:
 
@@ -113,9 +117,9 @@ After clarification, planning uses one planning model, two independent reviewer 
 uv run llm-plan-execute accept --run-dir .llm-plan-execute/runs/<run-id>
 ```
 
-Build then uses a speed/accuracy oriented model and repeats review with two separate reviewers plus a summarizing arbiter. Use `plan --yes` only for deliberate non-interactive automation that should accept the reviewed plan immediately.
+Build then uses a speed/accuracy oriented model and repeats review with two separate reviewers plus a summarizing arbiter. The `run` command prompts you to approve, cancel, or save the reviewed plan before build. Use separate `plan`, `accept`, `build`, and `report` commands for scripting or advanced control. Use `plan --yes` only for deliberate non-interactive automation that should accept the reviewed plan immediately.
 
-The final report includes model assignments, fallback warnings, token usage, estimated cost, and prompt improvement advice.
+Progress is written to stderr so stdout stays usable for command output. Pass `--quiet` to suppress progress, or `--verbose` to include provider error details. The final report includes model assignments, fallback warnings, build status, token usage, estimated cost, and prompt improvement advice.
 
 ## Using Skills From An Agent
 
@@ -139,7 +143,7 @@ The skills are optional. The CLI works directly from a terminal without any agen
 
 The current implementation is provider-ready for local Codex and Cursor Agent execution with estimated usage reporting:
 
-- `llm-plan-execute` CLI supports `init-config`, `models`, `plan`, `accept`, `build`, and `report`.
+- `llm-plan-execute` CLI supports `init-config`, `models`, `run`, `plan`, `accept`, `build`, and `report`.
 - Dry-run providers allow the full workflow to run without live provider calls.
 - Provider-specific CLI adapters are in place for Codex and Cursor Agent.
 - Config validation checks provider names, roles, score ranges, duplicate model ids, shape errors, and provider command availability.

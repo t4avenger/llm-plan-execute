@@ -4,6 +4,7 @@ import argparse
 import json
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -21,13 +22,23 @@ from .providers import ProviderRouter
 from .reporting import render_report
 from .selection import assign_models
 from .types import Clarification, ModelAssignment, ModelInfo, ProviderResult, RunState, Usage
-from .workflow import accept_plan, complete_planning, render_clarification, run_build, run_clarification, run_planning
+from .workflow import (
+    BuildFailedError,
+    accept_plan,
+    complete_planning,
+    render_clarification,
+    run_build,
+    run_clarification,
+    run_planning,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="llm-plan-execute")
     parser.add_argument("--config", type=Path, default=None, help="Path to config JSON.")
     parser.add_argument("--dry-run", action="store_true", help="Use simulated providers and models.")
+    parser.add_argument("--quiet", action="store_true", help="Suppress progress output.")
+    parser.add_argument("--verbose", action="store_true", help="Show provider error details in progress output.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init-config", help="Write a sample local config.")
@@ -44,6 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--prompt-file", type=Path, default=None)
     plan.add_argument("--yes", action="store_true", help="Accept the arbiter-revised plan non-interactively.")
     plan.add_argument("--no-clarify", action="store_true", help="Skip the clarification phase.")
+
+    run = sub.add_parser("run", help="Plan, approve, build, review, and report in one interactive flow.")
+    run.add_argument("--prompt", default=None)
+    run.add_argument("--prompt-file", type=Path, default=None)
+    run.add_argument("--no-clarify", action="store_true", help="Skip the clarification phase.")
 
     accept = sub.add_parser("accept", help="Accept a reviewed proposed plan.")
     accept.add_argument("--run-dir", type=Path, required=True)
@@ -75,27 +91,27 @@ def _run(argv: list[str] | None = None) -> int:
 
     app_config = load_config(args.config, dry_run=args.dry_run)
     router = ProviderRouter.from_config(app_config)
+    progress = ProgressReporter(enabled=not args.quiet, verbose=args.verbose, stream=sys.stderr)
 
-    return _dispatch_command(args, router, app_config.runs_dir)
+    return _dispatch_command(args, router, app_config.runs_dir, progress)
 
 
-def _dispatch_command(args: argparse.Namespace, router: ProviderRouter, runs_dir: Path) -> int:
-    if args.command == "models":
-        return _cmd_models(router)
-
-    if args.command == "plan":
-        return _cmd_plan(args, router, runs_dir)
-
-    if args.command == "build":
-        return _cmd_build(args, router)
-
-    if args.command == "accept":
-        return _cmd_accept(args)
-
-    if args.command == "report":
-        return _cmd_report(args)
-
-    return 1
+def _dispatch_command(
+    args: argparse.Namespace,
+    router: ProviderRouter,
+    runs_dir: Path,
+    progress: ProgressReporter,
+) -> int:
+    handlers = {
+        "models": lambda: _cmd_models(router),
+        "plan": lambda: _cmd_plan(args, router, runs_dir, progress),
+        "run": lambda: _cmd_run(args, router, runs_dir, progress),
+        "build": lambda: _cmd_build(args, router, progress),
+        "accept": lambda: _cmd_accept(args),
+        "report": lambda: _cmd_report(args),
+    }
+    handler = handlers.get(args.command)
+    return handler() if handler else 1
 
 
 def _cmd_init_config(args: argparse.Namespace) -> int:
@@ -161,12 +177,12 @@ def _cmd_models(router: ProviderRouter) -> int:
     return 0
 
 
-def _cmd_plan(args: argparse.Namespace, router: ProviderRouter, runs_dir: Path) -> int:
+def _cmd_plan(args: argparse.Namespace, router: ProviderRouter, runs_dir: Path, progress: ProgressReporter) -> int:
     prompt = _read_prompt(args.prompt, args.prompt_file)
     if args.no_clarify:
-        run = run_planning(prompt, runs_dir, router, auto_accept=args.yes)
+        run = run_planning(prompt, runs_dir, router, auto_accept=args.yes, progress=progress.update)
     else:
-        run = run_clarification(prompt, runs_dir, router)
+        run = run_clarification(prompt, runs_dir, router, progress=progress.update)
         clarification = run.clarification
         if clarification and clarification.status == "needs_questions":
             if not sys.stdin.isatty():
@@ -182,7 +198,7 @@ def _cmd_plan(args: argparse.Namespace, router: ProviderRouter, runs_dir: Path) 
             print(f"Clarification: answered {len(clarification.answers)} question(s).")
         else:
             print(f"Clarification: no questions required ({run.run_dir / '00-clarification.md'}).")
-        run = complete_planning(run, router, auto_accept=args.yes)
+        run = complete_planning(run, router, auto_accept=args.yes, progress=progress.update)
     print(f"Run: {run.run_id}")
     if args.yes:
         print(f"Accepted plan: {run.run_dir / '04-accepted-plan.md'}")
@@ -190,6 +206,60 @@ def _cmd_plan(args: argparse.Namespace, router: ProviderRouter, runs_dir: Path) 
         print(f"Proposed plan: {run.run_dir / '04-proposed-plan.md'}")
         print(f"Accept with: llm-plan-execute accept --run-dir {run.run_dir}")
     print(f"Report: {run.run_dir / 'report.md'}")
+    return 0
+
+
+def _cmd_run(args: argparse.Namespace, router: ProviderRouter, runs_dir: Path, progress: ProgressReporter) -> int:
+    prompt = _read_prompt(args.prompt, args.prompt_file)
+    if args.no_clarify:
+        run = run_planning(prompt, runs_dir, router, auto_accept=False, progress=progress.update)
+    else:
+        run = run_clarification(prompt, runs_dir, router, progress=progress.update)
+        clarification = run.clarification
+        if clarification and clarification.status == "needs_questions":
+            if not sys.stdin.isatty():
+                print(f"Run: {run.run_id}")
+                print(f"Clarification needed: {run.run_dir / '00-clarification.md'}")
+                print("Run requires an interactive terminal to answer clarification questions.")
+                print(f"Report: {run.run_dir / 'report.md'}")
+                return 2
+            clarification.answers = [_ask_question(question) for question in clarification.questions]
+            clarification.status = "clear"
+            write_text(run, "00-clarification.md", render_clarification(clarification))
+            write_state(run)
+            print(f"Clarification: answered {len(clarification.answers)} question(s).")
+        else:
+            print(f"Clarification: no questions required ({run.run_dir / '00-clarification.md'}).")
+        run = complete_planning(run, router, auto_accept=False, progress=progress.update)
+
+    proposed_path = run.run_dir / "04-proposed-plan.md"
+    proposed_plan = proposed_path.read_text(encoding="utf-8")
+    print(f"Run: {run.run_id}")
+    print(f"Proposed plan: {proposed_path}")
+    print("")
+    print(proposed_plan.rstrip())
+    print("")
+    decision = _approval_decision()
+    if decision == "cancel":
+        print(f"Canceled before build. Report: {run.run_dir / 'report.md'}")
+        return 130
+    if decision == "save-only":
+        print(f"Saved proposed plan. Accept later with: llm-plan-execute accept --run-dir {run.run_dir}")
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return 0
+
+    run = accept_plan(run)
+    try:
+        run = run_build(run, router, progress=progress.update)
+    except BuildFailedError as exc:
+        run = exc.run
+        print(f"Build failed: {run.run_dir / '05-build-output.md'}")
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return 1
+    print(f"Build output: {run.run_dir / '05-build-output.md'}")
+    print(f"Review summary: {run.run_dir / '08-build-review-summary.md'}")
+    print(f"Report: {run.run_dir / 'report.md'}")
+    print("Next options: inspect the report, accept the build as-is, or return to planning with review feedback.")
     return 0
 
 
@@ -203,10 +273,16 @@ def _cmd_accept(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_build(args: argparse.Namespace, router: ProviderRouter) -> int:
+def _cmd_build(args: argparse.Namespace, router: ProviderRouter, progress: ProgressReporter) -> int:
     raw = load_state(args.run_dir)
     run = _state_from_json(raw, args.run_dir)
-    run = run_build(run, router)
+    try:
+        run = run_build(run, router, progress=progress.update)
+    except BuildFailedError as exc:
+        run = exc.run
+        print(f"Build failed: {run.run_dir / '05-build-output.md'}")
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return 1
     print(f"Build output: {run.run_dir / '05-build-output.md'}")
     print(f"Review summary: {run.run_dir / '08-build-review-summary.md'}")
     print(f"Report: {run.run_dir / 'report.md'}")
@@ -247,6 +323,8 @@ def _state_from_json(raw: dict[str, object], run_dir: Path) -> RunState:
         created_at=str(raw.get("created_at", "")),
         accepted_plan=raw.get("accepted_plan") if isinstance(raw.get("accepted_plan"), str) else None,
         build_output=raw.get("build_output") if isinstance(raw.get("build_output"), str) else None,
+        build_status=raw.get("build_status") if isinstance(raw.get("build_status"), str) else None,
+        build_failure=raw.get("build_failure") if isinstance(raw.get("build_failure"), str) else None,
         warnings=_string_list(raw.get("warnings")),
         next_options=_string_list(raw.get("next_options")),
         clarification=_clarification_from_json(raw.get("clarification")),
@@ -331,3 +409,53 @@ def _clarification_from_json(value: object) -> Clarification | None:
 def _ask_question(question: str) -> str:
     print(question)
     return input("> ").strip()
+
+
+def _approval_decision() -> str:
+    if not sys.stdin.isatty():
+        return "save-only"
+    while True:
+        answer = input("Approve plan? [approve/cancel/save-only] > ").strip().lower()
+        if answer in {"approve", "a", "yes", "y"}:
+            return "approve"
+        if answer in {"cancel", "c", "no", "n"}:
+            return "cancel"
+        if answer in {"save-only", "save", "s"}:
+            return "save-only"
+        print("Enter approve, cancel, or save-only.")
+
+
+class ProgressReporter:
+    def __init__(self, *, enabled: bool, verbose: bool, stream: Any) -> None:
+        self.enabled = enabled
+        self.verbose = verbose
+        self.stream = stream
+        self.starts: dict[str, float] = {}
+
+    def update(
+        self,
+        event: str,
+        role: str,
+        run: RunState,
+        model: ModelInfo | None,
+        result: ProviderResult | None,
+        artifact: Path | None,
+    ) -> None:
+        if not self.enabled:
+            return
+        label = role.replace("_", " ")
+        if event == "start":
+            self.starts[role] = time.monotonic()
+            model_id = model.id if model else "unassigned"
+            print(f"[{run.run_id}] {label}: starting with {model_id}", file=self.stream)
+            return
+        if event == "finish":
+            elapsed = result.elapsed_seconds if result else time.monotonic() - self.starts.get(role, time.monotonic())
+            model_id = result.model.id if result else (model.id if model else "unassigned")
+            suffix = " failed" if result and result.error else " done"
+            print(f"[{run.run_id}] {label}: {model_id}{suffix} in {elapsed:.1f}s", file=self.stream)
+            if self.verbose and result and result.error:
+                print(f"[{run.run_id}] {label}: {result.error}", file=self.stream)
+            return
+        if event == "artifact" and artifact:
+            print(f"[{run.run_id}] {label}: wrote {artifact}", file=self.stream)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,9 @@ class ConfigValidation:
 
 
 def sample_config() -> dict[str, Any]:
+    codex_enabled = shutil.which("codex") is not None
+    claude_enabled = shutil.which("claude") is not None
+    cursor_enabled = shutil.which("cursor-agent") is not None
     return {
         "dry_run": False,
         "runs_dir": ".llm-plan-execute/runs",
@@ -57,7 +61,7 @@ def sample_config() -> dict[str, Any]:
             {
                 "name": "codex",
                 "command": "codex",
-                "enabled": True,
+                "enabled": codex_enabled,
                 "models": [
                     {
                         "name": "gpt-5.5",
@@ -82,7 +86,7 @@ def sample_config() -> dict[str, Any]:
             {
                 "name": "claude",
                 "command": "claude",
-                "enabled": False,
+                "enabled": claude_enabled,
                 "models": [
                     {
                         "name": "opus",
@@ -107,7 +111,7 @@ def sample_config() -> dict[str, Any]:
             {
                 "name": "cursor",
                 "command": "cursor-agent",
-                "enabled": False,
+                "enabled": cursor_enabled,
                 "models": [
                     {
                         "name": "auto",

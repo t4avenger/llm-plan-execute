@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 from .artifacts import write_state, write_text
@@ -16,26 +19,54 @@ from .prompts import (
 from .providers import ProviderRouter
 from .reporting import render_report
 from .selection import assign_models
-from .types import ROLES, Clarification, RunState
+from .types import ROLES, Clarification, ModelInfo, ProviderResult, RunState
+
+ProgressCallback = Callable[[str, str, RunState, ModelInfo | None, ProviderResult | None, Path | None], None]
 
 
-def run_planning(prompt: str, runs_dir: Path, router: ProviderRouter, *, auto_accept: bool) -> RunState:
+class BuildFailedError(ValueError):
+    def __init__(self, message: str, run: RunState) -> None:
+        super().__init__(message)
+        self.run = run
+
+
+def run_planning(
+    prompt: str,
+    runs_dir: Path,
+    router: ProviderRouter,
+    *,
+    auto_accept: bool,
+    progress: ProgressCallback | None = None,
+) -> RunState:
     models = router.available_models()
     assignments, warnings = assign_models(models)
     run = RunState.create(prompt, runs_dir)
     run.assignments = assignments
     run.warnings.extend(warnings)
-    return complete_planning(run, router, auto_accept=auto_accept)
+    return complete_planning(run, router, auto_accept=auto_accept, progress=progress)
 
 
-def run_clarification(prompt: str, runs_dir: Path, router: ProviderRouter) -> RunState:
+def run_clarification(
+    prompt: str,
+    runs_dir: Path,
+    router: ProviderRouter,
+    *,
+    progress: ProgressCallback | None = None,
+) -> RunState:
     models = router.available_models()
     assignments, warnings = assign_models(models)
     run = RunState.create(prompt, runs_dir)
     run.assignments = assignments
     run.warnings.extend(warnings)
 
-    result = router.run("clarifier", assignments["planner"].model, clarification_prompt(prompt))
+    result = _run_provider(
+        run,
+        router,
+        "clarifier",
+        assignments["planner"].model,
+        clarification_prompt(prompt),
+        progress,
+    )
     run.results.append(result)
     run.clarification = parse_clarification(result.output)
     write_text(run, "00-clarification.md", render_clarification(run.clarification))
@@ -44,30 +75,45 @@ def run_clarification(prompt: str, runs_dir: Path, router: ProviderRouter) -> Ru
     return run
 
 
-def complete_planning(run: RunState, router: ProviderRouter, *, auto_accept: bool) -> RunState:
+def complete_planning(
+    run: RunState,
+    router: ProviderRouter,
+    *,
+    auto_accept: bool,
+    progress: ProgressCallback | None = None,
+) -> RunState:
     planning_prompt = _planning_prompt(run)
-    planner = router.run("planner", run.assignments["planner"].model, planning_prompt)
+    planner = _run_provider(run, router, "planner", run.assignments["planner"].model, planning_prompt, progress)
     run.results.append(planner)
     write_text(run, "01-draft-plan.md", planner.output)
 
-    review_a = router.run(
+    review_a = _run_provider(
+        run,
+        router,
         "plan_reviewer_a",
         run.assignments["plan_reviewer_a"].model,
         plan_review_prompt(planner.output, "reviewer A"),
+        progress,
     )
-    review_b = router.run(
+    review_b = _run_provider(
+        run,
+        router,
         "plan_reviewer_b",
         run.assignments["plan_reviewer_b"].model,
         plan_review_prompt(planner.output, "reviewer B"),
+        progress,
     )
     run.results.extend([review_a, review_b])
     write_text(run, "02-plan-review-a.md", review_a.output)
     write_text(run, "03-plan-review-b.md", review_b.output)
 
-    arbiter = router.run(
+    arbiter = _run_provider(
+        run,
+        router,
         "plan_arbiter",
         run.assignments["plan_arbiter"].model,
         plan_arbiter_prompt(planner.output, review_a.output, review_b.output),
+        progress,
     )
     run.results.append(arbiter)
     if auto_accept:
@@ -96,34 +142,68 @@ def accept_plan(existing: RunState) -> RunState:
     return existing
 
 
-def run_build(existing: RunState, router: ProviderRouter) -> RunState:
+def run_build(existing: RunState, router: ProviderRouter, *, progress: ProgressCallback | None = None) -> RunState:
     if not existing.accepted_plan:
         raise ValueError("Run has no accepted plan. Review the proposed plan, then run the accept command.")
     _ensure_assignments(existing, router)
 
-    build = router.run("builder", existing.assignments["builder"].model, build_prompt(existing.accepted_plan))
+    before_changes = _workspace_changes(router.workspace)
+    build = _run_provider(
+        existing,
+        router,
+        "builder",
+        existing.assignments["builder"].model,
+        build_prompt(existing.accepted_plan),
+        progress,
+    )
     existing.results.append(build)
     existing.build_output = build.output
     write_text(existing, "05-build-output.md", build.output)
+    after_changes = _workspace_changes(router.workspace)
+    failure = _build_failure(existing, build, before_changes, after_changes, router.dry_run)
+    if failure:
+        existing.build_status = "failed"
+        existing.build_failure = failure
+        existing.warnings.append(f"Build failed: {failure}")
+        existing.next_options = [
+            "inspect 05-build-output.md",
+            "fix provider availability or builder errors",
+            "rerun build after the failure is resolved",
+        ]
+        write_text(existing, "05-build-output.md", build.output + "\n\n## Build Failure\n\n" + failure)
+        write_state(existing)
+        write_text(existing, "report.md", render_report(existing))
+        raise BuildFailedError(failure, existing)
 
-    review_a = router.run(
+    existing.build_status = "succeeded"
+
+    review_a = _run_provider(
+        existing,
+        router,
         "build_reviewer_a",
         existing.assignments["build_reviewer_a"].model,
         build_review_prompt(existing.accepted_plan, build.output, "implementation reviewer A"),
+        progress,
     )
-    review_b = router.run(
+    review_b = _run_provider(
+        existing,
+        router,
         "build_reviewer_b",
         existing.assignments["build_reviewer_b"].model,
         build_review_prompt(existing.accepted_plan, build.output, "implementation reviewer B"),
+        progress,
     )
     existing.results.extend([review_a, review_b])
     write_text(existing, "06-build-review-a.md", review_a.output)
     write_text(existing, "07-build-review-b.md", review_b.output)
 
-    arbiter = router.run(
+    arbiter = _run_provider(
+        existing,
+        router,
         "build_arbiter",
         existing.assignments["build_arbiter"].model,
         build_arbiter_prompt(review_a.output, review_b.output),
+        progress,
     )
     existing.results.append(arbiter)
     write_text(existing, "08-build-review-summary.md", arbiter.output)
@@ -136,6 +216,73 @@ def run_build(existing: RunState, router: ProviderRouter) -> RunState:
     write_state(existing)
     write_text(existing, "report.md", render_report(existing))
     return existing
+
+
+def _run_provider(
+    run: RunState,
+    router: ProviderRouter,
+    role: str,
+    model: ModelInfo,
+    prompt: str,
+    progress: ProgressCallback | None,
+) -> ProviderResult:
+    if progress:
+        progress("start", role, run, model, None, None)
+    result = router.run(role, model, prompt)
+    if progress:
+        progress("finish", role, run, model, result, None)
+    return result
+
+
+def _workspace_changes(workspace: Path) -> frozenset[str] | None:
+    git = shutil.which("git")
+    if git is None:
+        return None
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed git executable with static arguments.
+            [git, "status", "--short"],
+            cwd=workspace,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return frozenset(line for line in completed.stdout.splitlines() if line.strip())
+
+
+def _build_failure(
+    run: RunState,
+    build: ProviderResult,
+    before_changes: frozenset[str] | None,
+    after_changes: frozenset[str] | None,
+    dry_run: bool,
+) -> str | None:
+    if build.error:
+        return build.error
+    if dry_run or not _looks_code_changing(run.accepted_plan or ""):
+        return None
+    if before_changes is not None and after_changes is not None and before_changes == after_changes:
+        return "Builder completed without changing the workspace for a code-changing plan."
+    return None
+
+
+def _looks_code_changing(plan: str) -> bool:
+    text = plan.lower()
+    indicators = (
+        "implement",
+        "code",
+        "file",
+        "test",
+        "refactor",
+        "fix",
+        "build",
+        "feature",
+        "change",
+    )
+    return any(indicator in text for indicator in indicators)
 
 
 def _ensure_assignments(existing: RunState, router: ProviderRouter) -> None:
