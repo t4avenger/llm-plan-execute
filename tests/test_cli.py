@@ -82,6 +82,37 @@ def test_config_validate_reports_invalid_provider(tmp_path, capsys):
     assert "unsupported provider" in captured.err
 
 
+def test_missing_config_requires_init_config_or_dry_run(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main(["models"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Config file .llm-plan-execute/config.json was not found" in captured.err
+    assert "use --dry-run explicitly" in captured.err
+
+
+def test_config_validate_reports_missing_default_config(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main(["config", "validate"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "config file was not found" in captured.err
+
+
+def test_dry_run_without_config_still_works(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main(["--dry-run", "models"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "dry-codex:frontier-planner" in captured.out
+
+
 def test_config_validate_reports_missing_enabled_command(tmp_path, capsys, monkeypatch):
     config = tmp_path / "config.json"
     config.write_text(
@@ -183,6 +214,17 @@ def test_plan_without_clarify_prints_accept_command(tmp_path, capsys):
     assert "llm-plan-execute accept --run-dir" in captured.out
 
 
+def test_plan_prints_clear_clarification_status(tmp_path, capsys):
+    config = _write_dry_config(tmp_path)
+
+    exit_code = main(["--config", str(config), "plan", "--prompt", "Add a small feature"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Clarification: no questions required" in captured.out
+    assert "Proposed plan:" in captured.out
+
+
 def test_accept_command_promotes_plan(tmp_path, capsys):
     config = _write_dry_config(tmp_path)
     main(["--config", str(config), "plan", "--prompt", "Add a small feature", "--no-clarify"])
@@ -222,6 +264,7 @@ def test_interactive_clarification_marks_answered_questions_clear(tmp_path, caps
 
     captured = capsys.readouterr()
     assert exit_code == 0
+    assert "Clarification: answered 1 question(s)." in captured.out
     run_line = next(line for line in captured.out.splitlines() if line.startswith("Run:"))
     run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
     clarification = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["clarification"]

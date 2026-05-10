@@ -179,6 +179,9 @@ def _cmd_plan(args: argparse.Namespace, router: ProviderRouter, runs_dir: Path) 
             clarification.status = "clear"
             write_text(run, "00-clarification.md", render_clarification(clarification))
             write_state(run)
+            print(f"Clarification: answered {len(clarification.answers)} question(s).")
+        else:
+            print(f"Clarification: no questions required ({run.run_dir / '00-clarification.md'}).")
         run = complete_planning(run, router, auto_accept=args.yes)
     print(f"Run: {run.run_id}")
     if args.yes:
