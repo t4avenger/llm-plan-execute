@@ -176,6 +176,7 @@ def _cmd_plan(args: argparse.Namespace, router: ProviderRouter, runs_dir: Path) 
                 print(f"Report: {run.run_dir / 'report.md'}")
                 return 2
             clarification.answers = [_ask_question(question) for question in clarification.questions]
+            clarification.status = "clear"
             write_text(run, "00-clarification.md", render_clarification(clarification))
             write_state(run)
         run = complete_planning(run, router, auto_accept=args.yes)

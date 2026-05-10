@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from llm_plan_execute.cli import _state_from_json, main
@@ -9,13 +10,15 @@ def _write_dry_config(tmp_path: Path) -> Path:
     config = tmp_path / "config.json"
     runs_dir = tmp_path / "runs"
     config.write_text(
-        f"""
-{{
-  "dry_run": true,
-  "runs_dir": "{runs_dir}",
-  "providers": []
-}}
-""",
+        json.dumps(
+            {
+                "dry_run": True,
+                "runs_dir": str(runs_dir),
+                "providers": [],
+            },
+            indent=2,
+        )
+        + "\n",
         encoding="utf-8",
     )
     return config
@@ -208,6 +211,23 @@ def test_noninteractive_clarification_exits_before_plan(tmp_path, capsys, monkey
     run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
     assert (run_dir / "00-clarification.md").exists()
     assert not (run_dir / "01-draft-plan.md").exists()
+
+
+def test_interactive_clarification_marks_answered_questions_clear(tmp_path, capsys, monkeypatch):
+    config = _write_dry_config(tmp_path)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "Implement the requested behavior.")
+
+    exit_code = main(["--config", str(config), "plan", "--prompt", "Do an ambiguous thing"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    run_line = next(line for line in captured.out.splitlines() if line.startswith("Run:"))
+    run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
+    clarification = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["clarification"]
+    assert clarification["status"] == "clear"
+    assert clarification["answers"] == ["Implement the requested behavior."]
+    assert "- Status: clear" in (run_dir / "00-clarification.md").read_text(encoding="utf-8")
 
 
 def test_build_unaccepted_run_reports_accept_guidance(tmp_path, capsys):
