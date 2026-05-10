@@ -1,5 +1,6 @@
 import pytest
 
+from llm_plan_execute.build_review_schema import BuildRecommendation
 from llm_plan_execute.config import ExecutionConfig
 from llm_plan_execute.providers import DryRunProvider, Provider, ProviderRouter
 from llm_plan_execute.types import ExecutionPolicy, ModelAssignment, ModelInfo, ProviderResult, RunState, Usage
@@ -8,6 +9,8 @@ from llm_plan_execute.workflow import (
     _run_provider,
     accept_plan,
     complete_planning,
+    record_build_recommendation_application,
+    rerun_build_review,
     run_build,
     run_clarification,
     run_planning,
@@ -216,6 +219,46 @@ def test_provider_warning_is_recorded_on_run(tmp_path):
 
     assert result.warning == "warning text"
     assert run.warnings == ["warning text"]
+
+
+def test_rerun_build_review_requires_build_context(tmp_path):
+    with pytest.raises(ValueError, match="accepted plan and build output"):
+        rerun_build_review(RunState.create("prompt", tmp_path), ProviderRouter([DryRunProvider()]), feedback_history=[])
+
+
+def test_rerun_build_review_writes_review_artifacts(tmp_path):
+    provider = RecordingBuildProvider()
+    router = ProviderRouter([provider], workspace=tmp_path)
+    run = _accepted_build_run(tmp_path)
+    run.build_output = "build output"
+
+    rerun_build_review(run, router, feedback_history=["Check the CLI output."])
+
+    assert provider.calls == ["build_reviewer_a", "build_reviewer_b", "build_arbiter"]
+    assert (run.run_dir / "06-build-review-a.md").exists()
+    assert (run.run_dir / "07-build-review-b.md").exists()
+    assert (run.run_dir / "08-build-review-summary.md").exists()
+    assert run.next_options == [
+        "fix findings with the builder model",
+        "accept the build as-is",
+        "return to planning with review feedback",
+    ]
+
+
+def test_record_build_recommendation_application_writes_selected_items(tmp_path):
+    run = RunState.create("prompt", tmp_path / "runs")
+    run.run_dir.mkdir(parents=True)
+    recommendations = [
+        BuildRecommendation("a", "First", "Apply first."),
+        BuildRecommendation("b", "Second", "Apply second."),
+    ]
+
+    record_build_recommendation_application(run, recommendations, ["missing", "b"])
+
+    text = (run.run_dir / "09-build-review-applied.md").read_text(encoding="utf-8")
+    assert "Second (`b`)" in text
+    assert "missing" not in text
+    assert (run.run_dir / "report.md").exists()
 
 
 def _accepted_build_run(tmp_path):

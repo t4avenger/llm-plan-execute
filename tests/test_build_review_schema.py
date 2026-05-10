@@ -1,0 +1,128 @@
+import json
+
+from llm_plan_execute.build_review_schema import (
+    BuildRecommendation,
+    expand_with_dependencies,
+    map_numeric_selection_to_ids,
+    parse_recommendations_from_summary,
+    selection_requires_missing_dependency,
+)
+
+
+def test_parse_prefers_embedded_json_over_headings():
+    payload = json.dumps(
+        [
+            {
+                "id": "stable-one",
+                "title": "From JSON",
+                "description": "desc",
+                "depends_on": [],
+            }
+        ]
+    )
+    md = f"""# Summary
+
+<!-- llm-plan-execute:recommendations
+{payload}
+-->
+
+### Heading noise
+
+This would become heading-1 if JSON were ignored.
+"""
+    recs = parse_recommendations_from_summary(md)
+    assert len(recs) == 1
+    assert recs[0].id == "stable-one"
+    assert recs[0].title == "From JSON"
+
+
+def test_numeric_selection_maps_embedded_ids():
+    recs = [
+        BuildRecommendation(id="fix-tests", title="Tests", description="d"),
+        BuildRecommendation(id="fix-docs", title="Docs", description="d"),
+    ]
+    assert map_numeric_selection_to_ids(("2", "1"), recs) == ("fix-docs", "fix-tests")
+
+
+def test_expand_dependencies_order():
+    recs = [
+        BuildRecommendation(id="base", title="b", description="", depends_on=()),
+        BuildRecommendation(id="top", title="t", description="", depends_on=("base",)),
+    ]
+    assert expand_with_dependencies(["top"], recs) == ["base", "top"]
+
+
+def test_missing_dependency_id_not_in_list_reports():
+    recs = [
+        BuildRecommendation(id="orphan-dep", title="x", description="", depends_on=("not-a-rec",)),
+    ]
+    expanded = expand_with_dependencies(["orphan-dep"], recs)
+    assert expanded == ["orphan-dep"]
+    msg = selection_requires_missing_dependency(expanded, recs)
+    assert msg is not None
+    assert "not-a-rec" in msg
+
+
+def test_expand_with_dependencies_handles_cycles():
+    recs = [
+        BuildRecommendation(id="a", title="a", description="", depends_on=("b",)),
+        BuildRecommendation(id="b", title="b", description="", depends_on=("a",)),
+    ]
+    expanded = expand_with_dependencies(["a"], recs)
+    assert set(expanded) == {"a", "b"}
+
+
+def test_unclosed_embedded_marker_does_not_raise():
+    md = '<!-- llm-plan-execute:recommendations\n[{"id": "x", "title": "t", "description": "d"}]\n'
+    recs = parse_recommendations_from_summary(md)
+    assert isinstance(recs, list)
+
+
+def test_malformed_embedded_json_falls_back_to_heading_blocks():
+    md = """<!-- llm-plan-execute:recommendations
+not json
+-->
+
+### First
+Fix one.
+
+### Second
+Fix two.
+"""
+
+    recs = parse_recommendations_from_summary(md)
+
+    assert [rec.id for rec in recs] == ["heading-1", "heading-2"]
+    assert recs[0].title == "First"
+    assert recs[0].description == "Fix one."
+
+
+def test_invalid_embedded_items_are_ignored():
+    payload = json.dumps(
+        [
+            "not an object",
+            {"id": 1, "title": "bad"},
+            {"id": "ok", "title": "Good", "description": "desc", "depends_on": ["base", 3]},
+        ]
+    )
+
+    recs = parse_recommendations_from_summary(f"<!-- llm-plan-execute:recommendations\n{payload}\n-->")
+
+    assert recs == [
+        BuildRecommendation(id="ok", title="Good", description="desc", status="applicable", depends_on=("base", "3"))
+    ]
+
+
+def test_single_heading_falls_back_to_bullet_findings():
+    recs = parse_recommendations_from_summary("### One heading\nBody\n- bullet finding")
+
+    assert recs == [BuildRecommendation(id="finding-1", title="bullet finding", description="bullet finding")]
+
+
+def test_selection_requires_missing_dependency_direct():
+    recs = [
+        BuildRecommendation(id="r2", title="two", description="", depends_on=("r1",)),
+        BuildRecommendation(id="r1", title="one", description="", depends_on=()),
+    ]
+    assert selection_requires_missing_dependency(["r2"], recs) is not None
+    assert selection_requires_missing_dependency(["r1", "r2"], recs) is None

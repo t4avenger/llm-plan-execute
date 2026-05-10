@@ -81,13 +81,61 @@ Build output:
 def build_arbiter_prompt(review_a: str, review_b: str) -> str:
     return f"""Consolidate these build review findings.
 
-Return:
+Return human-readable Markdown with:
 - highest-priority findings
 - whether the user should fix findings, accept as-is, or return to planning
 - concise rationale
+
+Also append a machine-readable recommendation list for downstream selection. Use stable,
+semantic string IDs (short slugs), not numeric-only placeholders.
+
+Use exactly this HTML comment wrapper and a JSON array payload (no trailing text inside the comment):
+
+<!-- llm-plan-execute:recommendations
+[
+  {{
+    "id": "stable-slug-id",
+    "title": "short title",
+    "description": "what to change or verify",
+    "status": "applicable",
+    "depends_on": []
+  }}
+]
+-->
+
+Schema for each object:
+- id (string, required): stable across reruns for the same logical recommendation
+- title (string, required)
+- description (string, required)
+- status (string, optional): default "applicable"
+- depends_on (array of recommendation ids, optional): default []
 
 Review A:
 {review_a}
 
 Review B:
 {review_b}"""
+
+
+def plan_revision_prompt(run_prompt: str, prior_proposed_plan: str, feedback_history: list[str]) -> str:
+    history = "\n".join(f"- {item}" for item in feedback_history) if feedback_history else "- none"
+    return f"""Revise the implementation plan using the cumulative feedback history.
+
+Original request:
+{run_prompt}
+
+Previous proposed plan:
+{prior_proposed_plan}
+
+Cumulative plan feedback:
+{history}
+
+Return concise Markdown with summary, implementation changes, tests, assumptions, and any open questions.
+Preserve stable section headings where practical, but you may add or merge sections when clarity improves."""
+
+
+def build_review_feedback_suffix(feedback_history: list[str]) -> str:
+    if not feedback_history:
+        return ""
+    history = "\n".join(f"- {item}" for item in feedback_history)
+    return f"\n\nOperator feedback to incorporate (cumulative):\n{history}\n"

@@ -7,15 +7,18 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .artifacts import write_state, write_text
+from .build_review_schema import BuildRecommendation
 from .config import ExecutionConfig
 from .prompts import (
     build_arbiter_prompt,
     build_prompt,
+    build_review_feedback_suffix,
     build_review_prompt,
     clarification_prompt,
     clarified_planner_prompt,
     plan_arbiter_prompt,
     plan_review_prompt,
+    plan_revision_prompt,
     planner_prompt,
 )
 from .providers import ProviderRouter
@@ -24,6 +27,7 @@ from .selection import assign_models
 from .types import ROLES, Clarification, ExecutionPolicy, ModelInfo, ProviderResult, RunState, Usage
 
 ProgressCallback = Callable[[str, str, RunState, ModelInfo | None, ProviderResult | None, Path | None], None]
+_PROPOSED_PLAN_ARTIFACT = "04-proposed-plan.md"
 
 
 class BuildFailedError(ValueError):
@@ -97,8 +101,9 @@ def complete_planning(
     execution: ExecutionConfig | None = None,
     permission_mode: str | None = None,
     progress: ProgressCallback | None = None,
+    planner_prompt_override: str | None = None,
 ) -> RunState:
-    planning_prompt = _planning_prompt(run)
+    planning_prompt = planner_prompt_override if planner_prompt_override is not None else _planning_prompt(run)
     planner = _run_provider(
         run,
         router,
@@ -147,7 +152,7 @@ def complete_planning(
         run.accepted_plan = arbiter.output
         write_text(run, "04-accepted-plan.md", run.accepted_plan)
     else:
-        write_text(run, "04-proposed-plan.md", arbiter.output)
+        write_text(run, _PROPOSED_PLAN_ARTIFACT, arbiter.output)
 
     write_state(run)
     report = render_report(run)
@@ -155,10 +160,113 @@ def complete_planning(
     return run
 
 
+def revise_proposed_plan(
+    run: RunState,
+    router: ProviderRouter,
+    *,
+    execution: ExecutionConfig | None = None,
+    permission_mode: str | None = None,
+    progress: ProgressCallback | None = None,
+    feedback_history: list[str],
+) -> RunState:
+    proposed_path = run.run_dir / _PROPOSED_PLAN_ARTIFACT
+    prior = proposed_path.read_text(encoding="utf-8") if proposed_path.exists() else ""
+    history = list(feedback_history)
+    planner_prompt_override = plan_revision_prompt(run.prompt, prior, history)
+    return complete_planning(
+        run,
+        router,
+        auto_accept=False,
+        execution=execution,
+        permission_mode=permission_mode,
+        progress=progress,
+        planner_prompt_override=planner_prompt_override,
+    )
+
+
+def rerun_build_review(
+    existing: RunState,
+    router: ProviderRouter,
+    *,
+    execution: ExecutionConfig | None = None,
+    permission_mode: str | None = None,
+    progress: ProgressCallback | None = None,
+    feedback_history: list[str],
+) -> RunState:
+    if not existing.accepted_plan or not existing.build_output:
+        raise ValueError("Run must include accepted plan and build output before rerunning build review.")
+
+    feedback_suffix = build_review_feedback_suffix(feedback_history)
+    review_a = _run_provider(
+        existing,
+        router,
+        "build_reviewer_a",
+        existing.assignments["build_reviewer_a"].model,
+        build_review_prompt(existing.accepted_plan, existing.build_output, "implementation reviewer A")
+        + feedback_suffix,
+        _execution_policy(execution, "build_reviewer_a", permission_mode),
+        progress,
+    )
+    review_b = _run_provider(
+        existing,
+        router,
+        "build_reviewer_b",
+        existing.assignments["build_reviewer_b"].model,
+        build_review_prompt(existing.accepted_plan, existing.build_output, "implementation reviewer B")
+        + feedback_suffix,
+        _execution_policy(execution, "build_reviewer_b", permission_mode),
+        progress,
+    )
+    existing.results.extend([review_a, review_b])
+    write_text(existing, "06-build-review-a.md", review_a.output)
+    write_text(existing, "07-build-review-b.md", review_b.output)
+
+    arbiter = _run_provider(
+        existing,
+        router,
+        "build_arbiter",
+        existing.assignments["build_arbiter"].model,
+        build_arbiter_prompt(review_a.output, review_b.output),
+        _execution_policy(execution, "build_arbiter", permission_mode),
+        progress,
+    )
+    existing.results.append(arbiter)
+    write_text(existing, "08-build-review-summary.md", arbiter.output)
+
+    existing.next_options = [
+        "fix findings with the builder model",
+        "accept the build as-is",
+        "return to planning with review feedback",
+    ]
+    write_state(existing)
+    write_text(existing, "report.md", render_report(existing))
+    return existing
+
+
+def record_build_recommendation_application(
+    run: RunState,
+    recommendations: list[BuildRecommendation],
+    selected_ids: list[str],
+) -> None:
+    by_id = {rec.id: rec for rec in recommendations}
+    lines = ["# Applied Build Review Recommendations", ""]
+    for rec_id in selected_ids:
+        rec = by_id.get(rec_id)
+        if rec is None:
+            continue
+        lines.append(f"## {rec.title} (`{rec.id}`)")
+        lines.append("")
+        lines.append(rec.description)
+        lines.append("")
+    write_text(run, "09-build-review-applied.md", "\n".join(lines).rstrip())
+    write_text(run, "report.md", render_report(run))
+    write_state(run)
+
+
 def accept_plan(existing: RunState) -> RunState:
     if existing.build_output:
         raise ValueError("Run already has build output and cannot accept a different plan.")
-    proposed_path = existing.run_dir / "04-proposed-plan.md"
+    proposed_path = existing.run_dir / _PROPOSED_PLAN_ARTIFACT
     if not proposed_path.exists():
         raise ValueError("Run has no proposed plan to accept.")
 

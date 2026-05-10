@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import time
@@ -343,38 +344,88 @@ def _process_error(returncode: int, stderr: str | None) -> str | None:
     return f"Provider exited with code {returncode}"
 
 
+def _dry_planner_output(_prompt: str) -> str:
+    return (
+        "# Draft Plan\n\n"
+        "1. Clarify the goal and acceptance criteria.\n"
+        "2. Inspect the repository and identify the smallest implementation boundary.\n"
+        "3. Implement the feature behind clear interfaces.\n"
+        "4. Add focused tests and run verification.\n"
+        "5. Produce a concise report with risks and follow-up options.\n"
+    )
+
+
+def _dry_plan_arbiter_output(_prompt: str) -> str:
+    return (
+        "# Arbiter Decision\n\n"
+        "Incorporate reviewer suggestions about fallback handling, artifact formats, and tests. "
+        "Do not add provider-specific secrets or hard-coded credentials.\n"
+    )
+
+
+def _dry_build_arbiter_output(_prompt: str) -> str:
+    payload = json.dumps(
+        [
+            {
+                "id": "rec-1",
+                "title": "Harden provider fallbacks",
+                "description": "Add explicit fallback handling when provider CLIs are unavailable.",
+                "status": "applicable",
+                "depends_on": [],
+            },
+            {
+                "id": "rec-2",
+                "title": "Expand workflow tests",
+                "description": "Add coverage for reporting, selection parsing, and interactive defaults.",
+                "status": "applicable",
+                "depends_on": ["rec-1"],
+            },
+        ],
+        indent=2,
+    )
+    return (
+        "# Build Arbiter Decision\n\n"
+        f"<!-- llm-plan-execute:recommendations\n{payload}\n-->\n\n"
+        "- Highest priority: keep artifacts deterministic and machine-readable.\n"
+        "- Recommendation: fix findings unless risk is explicitly accepted.\n"
+    )
+
+
+def _dry_builder_output(_prompt: str) -> str:
+    return (
+        "# Build Result\n\n"
+        "The implementation was completed according to the accepted plan. "
+        "Run artifacts and report outputs were generated for review.\n"
+    )
+
+
+def _dry_reviewer_output(role: str, _prompt: str) -> str:
+    return (
+        f"# {role} Review\n\n"
+        "- Add explicit fallback handling for unavailable models.\n"
+        "- Ensure run artifacts are written in machine-readable and human-readable formats.\n"
+        "- Include tests for selection, reporting, and the dry-run provider.\n"
+    )
+
+
 def dry_response(role: str, prompt: str) -> str:
     if role == "clarifier":
-        return _dry_clarifier_response(prompt)
-    if role == "planner":
-        return (
-            "# Draft Plan\n\n"
-            "1. Clarify the goal and acceptance criteria.\n"
-            "2. Inspect the repository and identify the smallest implementation boundary.\n"
-            "3. Implement the feature behind clear interfaces.\n"
-            "4. Add focused tests and run verification.\n"
-            "5. Produce a concise report with risks and follow-up options.\n"
-        )
-    if "reviewer" in role:
-        return (
-            f"# {role} Review\n\n"
-            "- Add explicit fallback handling for unavailable models.\n"
-            "- Ensure run artifacts are written in machine-readable and human-readable formats.\n"
-            "- Include tests for selection, reporting, and the dry-run provider.\n"
-        )
-    if role.endswith("arbiter"):
-        return (
-            "# Arbiter Decision\n\n"
-            "Incorporate reviewer suggestions about fallback handling, artifact formats, and tests. "
-            "Do not add provider-specific secrets or hard-coded credentials.\n"
-        )
-    if role == "builder":
-        return (
-            "# Build Result\n\n"
-            "The implementation was completed according to the accepted plan. "
-            "Run artifacts and report outputs were generated for review.\n"
-        )
-    return f"# {role}\n\nProcessed prompt of {len(prompt)} characters."
+        text = _dry_clarifier_response(prompt)
+    elif role == "planner":
+        text = _dry_planner_output(prompt)
+    elif "reviewer" in role:
+        text = _dry_reviewer_output(role, prompt)
+    elif role == "plan_arbiter":
+        text = _dry_plan_arbiter_output(prompt)
+    elif role == "build_arbiter":
+        text = _dry_build_arbiter_output(prompt)
+    elif role.endswith("arbiter"):
+        text = "# Arbiter Decision\n\nConsolidate reviewer guidance and keep changes narrowly scoped.\n"
+    elif role == "builder":
+        text = _dry_builder_output(prompt)
+    else:
+        text = f"# {role}\n\nProcessed prompt of {len(prompt)} characters."
+    return text
 
 
 def _dry_clarifier_response(prompt: str) -> str:
