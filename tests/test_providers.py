@@ -2,7 +2,7 @@ import subprocess
 from pathlib import Path
 
 from llm_plan_execute.config import ProviderConfig
-from llm_plan_execute.providers import CLIProvider, CodexAdapter, CursorAdapter, Provider, ProviderRouter
+from llm_plan_execute.providers import ClaudeAdapter, CLIProvider, CodexAdapter, CursorAdapter, Provider, ProviderRouter
 from llm_plan_execute.types import ModelInfo, ProviderResult, Usage
 
 
@@ -76,6 +76,17 @@ def test_cursor_adapter_builds_headless_command():
         "--trust",
         "build feature",
     ]
+    assert command.cwd == workspace.resolve()
+
+
+def test_claude_adapter_builds_documented_extension_command():
+    model = ModelInfo("claude", "sonnet")
+    config = ProviderConfig("claude", "claude", True, (model,))
+    workspace = Path(".")
+
+    command = ClaudeAdapter().build_command(config, model, "review plan", workspace)
+
+    assert command.args == ["claude", "--model", "sonnet", "review plan"]
     assert command.cwd == workspace.resolve()
 
 

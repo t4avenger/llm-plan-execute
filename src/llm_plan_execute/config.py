@@ -138,7 +138,7 @@ def load_config(path: Path | None, *, dry_run: bool = False) -> AppConfig:
         raw = sample_config()
         raw["dry_run"] = True
 
-    validation = validate_config_data(raw)
+    validation = validate_config_data(raw, require_providers=not bool(raw.get("dry_run", False) or dry_run))
     if validation.errors:
         raise ValueError(format_validation(validation))
 
@@ -179,7 +179,7 @@ def parse_config(raw: dict[str, Any], *, dry_run: bool = False) -> AppConfig:
     )
 
 
-def validate_config_file(path: Path | None) -> ConfigValidation:
+def validate_config_file(path: Path | None, *, dry_run: bool = False) -> ConfigValidation:
     config_path = path or DEFAULT_CONFIG
     if config_path.exists():
         try:
@@ -192,24 +192,28 @@ def validate_config_file(path: Path | None) -> ConfigValidation:
     else:
         raw = sample_config()
         raw["dry_run"] = True
-    return validate_config_data(raw)
+    return validate_config_data(raw, require_providers=not bool(raw.get("dry_run", False) or dry_run))
 
 
-def validate_config_data(raw: object) -> ConfigValidation:
+def validate_config_data(raw: object, *, require_providers: bool | None = None) -> ConfigValidation:
     errors: list[ConfigIssue] = []
     warnings: list[ConfigIssue] = []
     seen_model_ids: set[str] = set()
 
     if not isinstance(raw, dict):
         return ConfigValidation((ConfigIssue("error", "$", "config must be a JSON object"),), ())
+    if require_providers is None:
+        require_providers = not bool(raw.get("dry_run", False))
 
     _validate_root_fields(raw, errors)
 
     providers = raw.get("providers")
+    if providers is None and not require_providers:
+        providers = []
     if not isinstance(providers, list):
         errors.append(ConfigIssue("error", "providers", "must be a list"))
         return ConfigValidation(tuple(errors), tuple(warnings))
-    if not providers:
+    if require_providers and not providers:
         errors.append(ConfigIssue("error", "providers", "must include at least one provider"))
 
     for index, provider in enumerate(providers):

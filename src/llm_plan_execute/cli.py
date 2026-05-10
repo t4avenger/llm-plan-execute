@@ -101,21 +101,23 @@ def _cmd_config(args: argparse.Namespace) -> int:
     if args.config_command != "validate":
         return 1
 
-    validation = validate_config_file(args.config)
+    validation = validate_config_file(args.config, dry_run=args.dry_run)
     if validation.errors:
         print(format_validation(validation), file=sys.stderr)
         return 1
 
     config = load_config(args.config, dry_run=args.dry_run)
-    command_errors = [
-        ConfigIssue(
-            "error",
-            f"providers[{index}].command",
-            f"enabled provider {provider.name!r} command {provider.command!r} was not found on PATH",
-        )
-        for index, provider in enumerate(config.providers)
-        if provider.enabled and shutil.which(provider.command) is None
-    ]
+    command_errors: list[ConfigIssue] = []
+    if not config.dry_run:
+        command_errors = [
+            ConfigIssue(
+                "error",
+                f"providers[{index}].command",
+                f"enabled provider {provider.name!r} command {provider.command!r} was not found on PATH",
+            )
+            for index, provider in enumerate(config.providers)
+            if provider.enabled and shutil.which(provider.command) is None
+        ]
     command_warnings = list(validation.warnings)
     for index, provider in enumerate(config.providers):
         if not provider.enabled:
