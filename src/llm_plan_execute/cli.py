@@ -436,7 +436,15 @@ def _state_from_json(raw: dict[str, object], run_dir: Path) -> RunState:
         clarification=_clarification_from_json(raw.get("clarification")),
         execution_policies=_execution_policies_from_json(raw.get("execution_policies")),
     )
-    for role, item in dict(raw.get("assignments", {})).items():
+    _load_assignments(run, raw.get("assignments", {}))
+    _load_results(run, raw.get("results", []))
+    return run
+
+
+def _load_assignments(run: RunState, value: object) -> None:
+    if not isinstance(value, dict):
+        return
+    for role, item in value.items():
         if not isinstance(item, dict):
             continue
         model_raw = item["model"]
@@ -447,30 +455,39 @@ def _state_from_json(raw: dict[str, object], run_dir: Path) -> RunState:
             reused=bool(item.get("reused", False)),
             reason=str(item.get("reason", "loaded from run")),
         )
-    for item in list(raw.get("results", [])):
+
+
+def _load_results(run: RunState, value: object) -> None:
+    if not isinstance(value, list):
+        return
+    for item in value:
         if not isinstance(item, dict):
             continue
-        usage_raw = item.get("usage", {})
-        if not isinstance(usage_raw, dict):
-            usage_raw = {}
-        run.results.append(
-            ProviderResult(
-                role=str(item["role"]),
-                model=_model_from_json(item["model"]),
-                prompt=str(item.get("prompt", "")),
-                output=str(item.get("output", "")),
-                usage=Usage(
-                    input_tokens=int(usage_raw.get("input_tokens", 0)),
-                    output_tokens=int(usage_raw.get("output_tokens", 0)),
-                    cost_usd=_optional_float(usage_raw.get("cost_usd")),
-                    exact=bool(usage_raw.get("exact", False)),
-                    confidence=str(usage_raw.get("confidence", "estimated")),
-                ),
-                elapsed_seconds=float(item.get("elapsed_seconds", 0.0)),
-                error=item.get("error") if isinstance(item.get("error"), str) else None,
-            )
-        )
-    return run
+        run.results.append(_provider_result_from_json(item))
+
+
+def _provider_result_from_json(item: dict[str, object]) -> ProviderResult:
+    return ProviderResult(
+        role=str(item["role"]),
+        model=_model_from_json(item["model"]),
+        prompt=str(item.get("prompt", "")),
+        output=str(item.get("output", "")),
+        usage=_usage_from_json(item.get("usage", {})),
+        elapsed_seconds=float(item.get("elapsed_seconds", 0.0)),
+        error=item.get("error") if isinstance(item.get("error"), str) else None,
+        warning=item.get("warning") if isinstance(item.get("warning"), str) else None,
+    )
+
+
+def _usage_from_json(value: object) -> Usage:
+    raw = value if isinstance(value, dict) else {}
+    return Usage(
+        input_tokens=int(raw.get("input_tokens", 0)),
+        output_tokens=int(raw.get("output_tokens", 0)),
+        cost_usd=_optional_float(raw.get("cost_usd")),
+        exact=bool(raw.get("exact", False)),
+        confidence=str(raw.get("confidence", "estimated")),
+    )
 
 
 def _model_from_json(model_raw: Any) -> ModelInfo:
@@ -593,17 +610,30 @@ class ProgressReporter:
             return
         label = role.replace("_", " ")
         if event == "start":
-            self.starts[role] = time.monotonic()
-            model_id = model.id if model else "unassigned"
-            print(f"[{run.run_id}] {label}: starting with {model_id}", file=self.stream)
+            self._start(role, run, label, model)
             return
         if event == "finish":
-            elapsed = result.elapsed_seconds if result else time.monotonic() - self.starts.get(role, time.monotonic())
-            model_id = result.model.id if result else (model.id if model else "unassigned")
-            suffix = " failed" if result and result.error else " done"
-            print(f"[{run.run_id}] {label}: {model_id}{suffix} in {elapsed:.1f}s", file=self.stream)
-            if self.verbose and result and result.error:
-                print(f"[{run.run_id}] {label}: {result.error}", file=self.stream)
+            self._finish(role, run, label, model, result)
             return
         if event == "artifact" and artifact:
             print(f"[{run.run_id}] {label}: wrote {artifact}", file=self.stream)
+
+    def _start(self, role: str, run: RunState, label: str, model: ModelInfo | None) -> None:
+        self.starts[role] = time.monotonic()
+        model_id = model.id if model else "unassigned"
+        print(f"[{run.run_id}] {label}: starting with {model_id}", file=self.stream)
+
+    def _finish(
+        self,
+        role: str,
+        run: RunState,
+        label: str,
+        model: ModelInfo | None,
+        result: ProviderResult | None,
+    ) -> None:
+        elapsed = result.elapsed_seconds if result else time.monotonic() - self.starts.get(role, time.monotonic())
+        model_id = result.model.id if result else (model.id if model else "unassigned")
+        suffix = " failed" if result and result.error else " done"
+        print(f"[{run.run_id}] {label}: {model_id}{suffix} in {elapsed:.1f}s", file=self.stream)
+        if self.verbose and result and result.error:
+            print(f"[{run.run_id}] {label}: {result.error}", file=self.stream)

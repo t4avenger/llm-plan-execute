@@ -17,3 +17,10 @@ repos:
       - id: detect-private-key
       - id: mixed-line-ending
         args: [--fix=lf]
+  - repo: local
+    hooks:
+      - id: complexipy
+        name: cognitive complexity
+        entry: uv run --locked complexipy src --max-complexity-allowed 15 --failed --plain
+        language: system
+        pass_filenames: false

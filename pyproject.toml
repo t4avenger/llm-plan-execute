@@ -17,6 +17,7 @@ llm-plan-execute = "llm_plan_execute.cli:main"
 
 [dependency-groups]
 dev = [
+    "complexipy>=5.4.1",
     "pre-commit>=4.2.0",
     "pytest>=8.3.5",
     "pytest-cov>=7.1.0",

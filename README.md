@@ -101,7 +101,7 @@ The real-provider path uses explicit adapters for each supported CLI:
 
 Execution permissions are passed to provider CLIs for every model call. By default, planning and review calls use `read-only`, while the builder uses `workspace-write`. Override a command with `--permission-mode read-only|workspace-write|full-access`, and add extra writable locations with repeated `--writable-dir <path>`.
 
-Codex is invoked as `codex exec --model <model> --sandbox <mode> --cd <workspace> <prompt>` for normal modes, with `full-access` mapped to `--dangerously-bypass-approvals-and-sandbox`. Cursor Agent is invoked as `cursor-agent --print --output-format text --model <model> --workspace <workspace> --trust <prompt>`; `read-only` adds `--mode plan --sandbox enabled`, and `full-access` adds `--force --sandbox disabled`. Claude remains a documented extension point, but it should stay disabled unless the `claude` command is installed and an adapter has been validated for the local CLI version.
+Codex is invoked as `codex exec --model <model> --sandbox <mode> --cd <workspace> <prompt>` for normal modes, with `full-access` mapped to `--dangerously-bypass-approvals-and-sandbox`. Cursor Agent is invoked as `cursor-agent --print --output-format text --model <model> --workspace <workspace> --trust <prompt>`; `read-only` adds `--mode plan`, and `full-access` adds `--force --sandbox disabled`. If Cursor reports that sandbox mode is enabled but unavailable on the local system, the CLI retries once without Cursor sandbox flags and records a warning in the run report. Claude remains a documented extension point, but it should stay disabled unless the `claude` command is installed and an adapter has been validated for the local CLI version.
 
 Common failure modes:
 
@@ -111,6 +111,7 @@ Common failure modes:
 - `config validate` reports a missing command: install the provider CLI or set that provider to `"enabled": false`.
 - `models` reports no available models: use `--dry-run`, enable at least one installed provider, or add models with roles that match the workflow.
 - Provider output is empty with stderr: inspect the run report and the provider's authentication or workspace trust status.
+- Cursor reports that sandbox mode is enabled but unavailable: the CLI retries without Cursor sandbox flags when possible. For persistent Cursor sandbox failures, follow Cursor's terminal-agent troubleshooting and consider `agent sandbox disable` to use allowlist mode.
 - Agents cannot read files, edit files, or run needed commands: use `--permission-mode workspace-write` for repo-local work, or explicitly choose `full-access` only when you want the provider CLI to bypass its normal approval or sandbox boundary.
 
 ## Workflow
