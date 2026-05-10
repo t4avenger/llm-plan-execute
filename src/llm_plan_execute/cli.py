@@ -11,6 +11,7 @@ from typing import Any
 from .artifacts import load_state, write_state, write_text
 from .config import (
     DEFAULT_CONFIG,
+    AppConfig,
     ConfigIssue,
     ConfigValidation,
     ExecutionConfig,
@@ -112,7 +113,7 @@ def _run(argv: list[str] | None = None) -> int:
 def _dispatch_command(
     args: argparse.Namespace,
     router: ProviderRouter,
-    app_config: Any,
+    app_config: AppConfig,
     progress: ProgressReporter,
 ) -> int:
     handlers = {
@@ -523,6 +524,8 @@ def _execution_policies_from_json(value: object) -> dict[str, ExecutionPolicy]:
         dirs = item.get("writable_dirs", [])
         if not isinstance(mode, str) or mode not in PERMISSION_MODES:
             continue
+        if not isinstance(dirs, list):
+            dirs = []
         policies[role] = ExecutionPolicy(
             mode,
             tuple(Path(path) for path in dirs if isinstance(path, str)),
@@ -545,20 +548,6 @@ def _execution_with_cli_dirs(execution: ExecutionConfig, writable_dirs: list[Pat
 def _ask_question(question: str) -> str:
     print(question)
     return input("> ").strip()
-
-
-def _approval_decision() -> str:
-    if not sys.stdin.isatty():
-        return "save-only"
-    while True:
-        answer = input("Approve plan? [approve/cancel/save-only] > ").strip().lower()
-        if answer in {"approve", "a", "yes", "y"}:
-            return "approve"
-        if answer in {"cancel", "c", "no", "n"}:
-            return "cancel"
-        if answer in {"save-only", "save", "s"}:
-            return "save-only"
-        print("Enter approve, cancel, or save-only.")
 
 
 def _run_approval_decision(default_permission: str) -> tuple[str, str | None]:

@@ -378,7 +378,7 @@ def test_build_permission_mode_is_recorded(tmp_path, capsys):
 
     exit_code = main(["--config", str(config), "build", "--run-dir", str(run_dir), "--permission-mode", "full-access"])
 
-    captured = capsys.readouterr()
+    capsys.readouterr()
     assert exit_code == 0
     policies = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["execution_policies"]
     assert policies["builder"]["mode"] == "full-access"

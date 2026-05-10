@@ -16,12 +16,12 @@ jobs:
       - name: Install uv
         run: pipx install uv
       - name: Sync dependencies
-        run: uv sync --dev
+        run: uv sync --dev --locked --no-build --no-install-project
       - name: Ruff lint
-        run: uv run ruff check .
+        run: uv run --locked --no-sync ruff check .
       - name: Ruff format
-        run: uv run ruff format --check .
+        run: uv run --locked --no-sync ruff format --check .
       - name: Pytest
-        run: uv run pytest
+        run: uv run --locked --no-sync pytest
       - name: Pre-commit
-        run: uv run pre-commit run --all-files
+        run: uv run --locked --no-sync pre-commit run --all-files

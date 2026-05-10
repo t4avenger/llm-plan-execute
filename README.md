@@ -171,7 +171,6 @@ Known follow-ups:
 - Add exact usage parsing per provider when CLIs expose structured usage.
 - Add structured JSON output mode for provider calls where available.
 - Add release workflow and versioning policy.
-- Add coverage reporting and publish coverage into Sonar.
 - Add Dependabot or Renovate for pinned actions and Python tooling.
 - Add a security policy, contribution guide, and changelog once external contributors are expected.
 - Add real integration tests gated behind opt-in environment variables for authenticated provider CLIs.

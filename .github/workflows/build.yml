@@ -15,6 +15,12 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0 # Shallow clones should be disabled for a better relevancy of analysis
+      - name: Install uv
+        run: pipx install uv
+      - name: Sync dependencies
+        run: uv sync --dev --locked --no-build --no-install-project
+      - name: Generate coverage report
+        run: uv run --locked --no-sync pytest --cov=src/llm_plan_execute --cov-report=xml
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6.0.0
         env:
