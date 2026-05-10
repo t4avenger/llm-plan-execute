@@ -21,8 +21,10 @@ Run the workflow with simulated providers:
 
 ```bash
 uv run llm-plan-execute --dry-run models
-uv run llm-plan-execute --dry-run plan --prompt "Add a small feature" --yes
+uv run llm-plan-execute --dry-run plan --prompt "Add a small feature"
+uv run llm-plan-execute --dry-run accept --run-dir .llm-plan-execute/runs/<run-id>
 uv run llm-plan-execute --dry-run build --run-dir .llm-plan-execute/runs/<run-id>
+uv run llm-plan-execute --dry-run report --run-dir .llm-plan-execute/runs/<run-id>
 ```
 
 Dry-run mode is deterministic and never shells out to provider CLIs.
@@ -99,15 +101,41 @@ Common failure modes:
 
 ## Workflow
 
-Planning uses one planning model, two independent reviewer models, and an arbiter model that decides which suggestions enter the accepted plan. Build then uses a speed/accuracy oriented model and repeats review with two separate reviewers plus a summarizing arbiter.
+Planning first checks whether the request needs clarification. In an interactive terminal, `plan` asks those questions before drafting. In non-interactive use, it writes `00-clarification.md` and exits so the caller can provide a clearer prompt or rerun with `--no-clarify`.
+
+After clarification, planning uses one planning model, two independent reviewer models, and an arbiter model. By default, the arbiter output is written as `04-proposed-plan.md` for review. Accept that exact reviewed plan with:
+
+```bash
+uv run llm-plan-execute accept --run-dir .llm-plan-execute/runs/<run-id>
+```
+
+Build then uses a speed/accuracy oriented model and repeats review with two separate reviewers plus a summarizing arbiter. Use `plan --yes` only for deliberate non-interactive automation that should accept the reviewed plan immediately.
 
 The final report includes model assignments, fallback warnings, token usage, estimated cost, and prompt improvement advice.
+
+## Using Skills From An Agent
+
+The repository includes optional skill/rule files that tell host agents how to use this CLI instead of trying to simulate the workflow in one response:
+
+- Codex: `skills/codex/SKILL.md`
+- Claude: `skills/claude/CLAUDE.md`
+- Cursor-style agents: `skills/cursor/llm-plan-execute.md`
+
+Install or reference the file that matches your agent environment according to that agent's local skill/rule mechanism:
+
+- For Codex, copy `skills/codex` into your Codex skills directory as `llm-plan-execute`, or otherwise register `skills/codex/SKILL.md` with the session.
+- For Claude, copy the guidance from `skills/claude/CLAUDE.md` into the project or user `CLAUDE.md` that your Claude environment reads.
+- For Cursor-style agents, copy `skills/cursor/llm-plan-execute.md` into the rules location your Cursor environment reads, such as a project rules directory.
+
+Once loaded, the agent should clarify ambiguous work, run `llm-plan-execute plan`, show you the proposed plan and report, run `llm-plan-execute accept` only after you approve the plan, then run `build`.
+
+The skills are optional. The CLI works directly from a terminal without any agent.
 
 ## Production Readiness
 
 The current implementation is provider-ready for local Codex and Cursor Agent execution with estimated usage reporting:
 
-- `llm-plan-execute` CLI supports `init-config`, `models`, `plan`, `build`, and `report`.
+- `llm-plan-execute` CLI supports `init-config`, `models`, `plan`, `accept`, `build`, and `report`.
 - Dry-run providers allow the full workflow to run without live provider calls.
 - Provider-specific CLI adapters are in place for Codex and Cursor Agent.
 - Config validation checks provider names, roles, score ranges, duplicate model ids, shape errors, and provider command availability.

@@ -1,13 +1,36 @@
 from __future__ import annotations
 
 
+def clarification_prompt(user_prompt: str) -> str:
+    return f"""Decide whether this implementation request has enough information to plan safely.
+
+Request:
+{user_prompt}
+
+Return exactly this plain-text format:
+STATUS: clear or needs_questions
+QUESTIONS:
+- question text, or none
+ASSUMPTIONS:
+- assumption text, or none
+
+Ask questions only for decisions that materially change scope, interfaces, data flow, tests, or acceptance criteria."""
+
+
 def planner_prompt(user_prompt: str) -> str:
     return f"""Create a decision-complete implementation plan for this request.
 
 Request:
 {user_prompt}
 
-Return concise Markdown with summary, implementation changes, tests, and assumptions."""
+Return concise Markdown with summary, implementation changes, tests, assumptions, and any open questions."""
+
+
+def clarified_planner_prompt(user_prompt: str, questions: list[str], answers: list[str]) -> str:
+    answer_lines = "\n".join(
+        f"- Q: {question}\n  A: {answer}" for question, answer in zip(questions, answers, strict=False)
+    )
+    return planner_prompt(f"{user_prompt}\n\nClarifications:\n{answer_lines}")
 
 
 def plan_review_prompt(plan: str, reviewer_name: str) -> str:

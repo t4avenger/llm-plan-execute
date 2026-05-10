@@ -7,6 +7,8 @@ from .prompts import (
     build_arbiter_prompt,
     build_prompt,
     build_review_prompt,
+    clarification_prompt,
+    clarified_planner_prompt,
     plan_arbiter_prompt,
     plan_review_prompt,
     planner_prompt,
@@ -14,7 +16,7 @@ from .prompts import (
 from .providers import ProviderRouter
 from .reporting import render_report
 from .selection import assign_models
-from .types import ROLES, RunState
+from .types import ROLES, Clarification, RunState
 
 
 def run_planning(prompt: str, runs_dir: Path, router: ProviderRouter, *, auto_accept: bool) -> RunState:
@@ -23,19 +25,39 @@ def run_planning(prompt: str, runs_dir: Path, router: ProviderRouter, *, auto_ac
     run = RunState.create(prompt, runs_dir)
     run.assignments = assignments
     run.warnings.extend(warnings)
+    return complete_planning(run, router, auto_accept=auto_accept)
 
-    planner = router.run("planner", assignments["planner"].model, planner_prompt(prompt))
+
+def run_clarification(prompt: str, runs_dir: Path, router: ProviderRouter) -> RunState:
+    models = router.available_models()
+    assignments, warnings = assign_models(models)
+    run = RunState.create(prompt, runs_dir)
+    run.assignments = assignments
+    run.warnings.extend(warnings)
+
+    result = router.run("clarifier", assignments["planner"].model, clarification_prompt(prompt))
+    run.results.append(result)
+    run.clarification = parse_clarification(result.output)
+    write_text(run, "00-clarification.md", render_clarification(run.clarification))
+    write_state(run)
+    write_text(run, "report.md", render_report(run))
+    return run
+
+
+def complete_planning(run: RunState, router: ProviderRouter, *, auto_accept: bool) -> RunState:
+    planning_prompt = _planning_prompt(run)
+    planner = router.run("planner", run.assignments["planner"].model, planning_prompt)
     run.results.append(planner)
     write_text(run, "01-draft-plan.md", planner.output)
 
     review_a = router.run(
         "plan_reviewer_a",
-        assignments["plan_reviewer_a"].model,
+        run.assignments["plan_reviewer_a"].model,
         plan_review_prompt(planner.output, "reviewer A"),
     )
     review_b = router.run(
         "plan_reviewer_b",
-        assignments["plan_reviewer_b"].model,
+        run.assignments["plan_reviewer_b"].model,
         plan_review_prompt(planner.output, "reviewer B"),
     )
     run.results.extend([review_a, review_b])
@@ -44,7 +66,7 @@ def run_planning(prompt: str, runs_dir: Path, router: ProviderRouter, *, auto_ac
 
     arbiter = router.run(
         "plan_arbiter",
-        assignments["plan_arbiter"].model,
+        run.assignments["plan_arbiter"].model,
         plan_arbiter_prompt(planner.output, review_a.output, review_b.output),
     )
     run.results.append(arbiter)
@@ -60,9 +82,23 @@ def run_planning(prompt: str, runs_dir: Path, router: ProviderRouter, *, auto_ac
     return run
 
 
+def accept_plan(existing: RunState) -> RunState:
+    if existing.build_output:
+        raise ValueError("Run already has build output and cannot accept a different plan.")
+    proposed_path = existing.run_dir / "04-proposed-plan.md"
+    if not proposed_path.exists():
+        raise ValueError("Run has no proposed plan to accept.")
+
+    existing.accepted_plan = proposed_path.read_text(encoding="utf-8").rstrip()
+    write_text(existing, "04-accepted-plan.md", existing.accepted_plan)
+    write_state(existing)
+    write_text(existing, "report.md", render_report(existing))
+    return existing
+
+
 def run_build(existing: RunState, router: ProviderRouter) -> RunState:
     if not existing.accepted_plan:
-        raise ValueError("Run has no accepted plan. Run the plan command with --yes before building.")
+        raise ValueError("Run has no accepted plan. Review the proposed plan, then run the accept command.")
     _ensure_assignments(existing, router)
 
     build = router.run("builder", existing.assignments["builder"].model, build_prompt(existing.accepted_plan))
@@ -111,3 +147,83 @@ def _ensure_assignments(existing: RunState, router: ProviderRouter) -> None:
         existing.assignments[role] = assignments[role]
     existing.warnings.extend(warnings)
     existing.warnings.append(f"Filled missing model assignments for roles: {', '.join(missing_roles)}.")
+
+
+def parse_clarification(output: str) -> Clarification:
+    status = "clear"
+    questions: list[str] = []
+    assumptions: list[str] = []
+    section: str | None = None
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        lower = line.lower()
+        if _is_status_line(lower):
+            raw_status = line.partition(":")[2].strip().lower()
+            status = "needs_questions" if "question" in raw_status else "clear"
+            continue
+        if _is_questions_header(lower):
+            section = "questions"
+            continue
+        if _is_assumptions_header(lower):
+            section = "assumptions"
+            continue
+        if not line.startswith("-"):
+            continue
+
+        _append_clarification_item(section, line, questions, assumptions)
+
+    if questions:
+        status = "needs_questions"
+    return Clarification(status=status, questions=questions, assumptions=assumptions, raw_output=output)
+
+
+def render_clarification(clarification: Clarification) -> str:
+    lines = ["# Clarification", "", f"- Status: {clarification.status}", "", "## Questions"]
+    lines.extend(f"- {question}" for question in clarification.questions)
+    if not clarification.questions:
+        lines.append("- none")
+    lines.extend(["", "## Answers"])
+    lines.extend(f"- {answer}" for answer in clarification.answers)
+    if not clarification.answers:
+        lines.append("- none")
+    lines.extend(["", "## Assumptions"])
+    lines.extend(f"- {assumption}" for assumption in clarification.assumptions)
+    if not clarification.assumptions:
+        lines.append("- none")
+    lines.extend(["", "## Raw Output", clarification.raw_output.rstrip()])
+    return "\n".join(lines)
+
+
+def _planning_prompt(run: RunState) -> str:
+    clarification = run.clarification
+    if clarification and clarification.questions and clarification.answers:
+        return clarified_planner_prompt(run.prompt, clarification.questions, clarification.answers)
+    return planner_prompt(run.prompt)
+
+
+def _is_status_line(line: str) -> bool:
+    return line.startswith("status:")
+
+
+def _is_questions_header(line: str) -> bool:
+    return line.startswith("questions:")
+
+
+def _is_assumptions_header(line: str) -> bool:
+    return line.startswith("assumptions:")
+
+
+def _append_clarification_item(
+    section: str | None,
+    line: str,
+    questions: list[str],
+    assumptions: list[str],
+) -> None:
+    item = line[1:].strip()
+    if not item or item.lower() == "none":
+        return
+    if section == "questions":
+        questions.append(item)
+    elif section == "assumptions":
+        assumptions.append(item)

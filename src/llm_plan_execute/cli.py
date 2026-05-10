@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .artifacts import load_state
+from .artifacts import load_state, write_state, write_text
 from .config import (
     DEFAULT_CONFIG,
     ConfigIssue,
@@ -20,8 +20,8 @@ from .config import (
 from .providers import ProviderRouter
 from .reporting import render_report
 from .selection import assign_models
-from .types import ModelAssignment, ModelInfo, ProviderResult, RunState, Usage
-from .workflow import run_build, run_planning
+from .types import Clarification, ModelAssignment, ModelInfo, ProviderResult, RunState, Usage
+from .workflow import accept_plan, complete_planning, render_clarification, run_build, run_clarification, run_planning
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +43,10 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--prompt", default=None)
     plan.add_argument("--prompt-file", type=Path, default=None)
     plan.add_argument("--yes", action="store_true", help="Accept the arbiter-revised plan non-interactively.")
+    plan.add_argument("--no-clarify", action="store_true", help="Skip the clarification phase.")
+
+    accept = sub.add_parser("accept", help="Accept a reviewed proposed plan.")
+    accept.add_argument("--run-dir", type=Path, required=True)
 
     build = sub.add_parser("build", help="Run build and review from an accepted plan.")
     build.add_argument("--run-dir", type=Path, required=True)
@@ -84,6 +88,9 @@ def _dispatch_command(args: argparse.Namespace, router: ProviderRouter, runs_dir
 
     if args.command == "build":
         return _cmd_build(args, router)
+
+    if args.command == "accept":
+        return _cmd_accept(args)
 
     if args.command == "report":
         return _cmd_report(args)
@@ -156,13 +163,38 @@ def _cmd_models(router: ProviderRouter) -> int:
 
 def _cmd_plan(args: argparse.Namespace, router: ProviderRouter, runs_dir: Path) -> int:
     prompt = _read_prompt(args.prompt, args.prompt_file)
-    run = run_planning(prompt, runs_dir, router, auto_accept=args.yes)
+    if args.no_clarify:
+        run = run_planning(prompt, runs_dir, router, auto_accept=args.yes)
+    else:
+        run = run_clarification(prompt, runs_dir, router)
+        clarification = run.clarification
+        if clarification and clarification.status == "needs_questions":
+            if not sys.stdin.isatty():
+                print(f"Run: {run.run_id}")
+                print(f"Clarification needed: {run.run_dir / '00-clarification.md'}")
+                print("Answer the questions and rerun planning, or use --no-clarify to plan with assumptions.")
+                print(f"Report: {run.run_dir / 'report.md'}")
+                return 2
+            clarification.answers = [_ask_question(question) for question in clarification.questions]
+            write_text(run, "00-clarification.md", render_clarification(clarification))
+            write_state(run)
+        run = complete_planning(run, router, auto_accept=args.yes)
     print(f"Run: {run.run_id}")
     if args.yes:
         print(f"Accepted plan: {run.run_dir / '04-accepted-plan.md'}")
     else:
         print(f"Proposed plan: {run.run_dir / '04-proposed-plan.md'}")
-        print("Rerun planning with --yes when you want this run to be buildable.")
+        print(f"Accept with: llm-plan-execute accept --run-dir {run.run_dir}")
+    print(f"Report: {run.run_dir / 'report.md'}")
+    return 0
+
+
+def _cmd_accept(args: argparse.Namespace) -> int:
+    raw = load_state(args.run_dir)
+    run = _state_from_json(raw, args.run_dir)
+    run = accept_plan(run)
+    print(f"Accepted plan: {run.run_dir / '04-accepted-plan.md'}")
+    print(f"Build with: llm-plan-execute build --run-dir {run.run_dir}")
     print(f"Report: {run.run_dir / 'report.md'}")
     return 0
 
@@ -213,6 +245,7 @@ def _state_from_json(raw: dict[str, object], run_dir: Path) -> RunState:
         build_output=raw.get("build_output") if isinstance(raw.get("build_output"), str) else None,
         warnings=_string_list(raw.get("warnings")),
         next_options=_string_list(raw.get("next_options")),
+        clarification=_clarification_from_json(raw.get("clarification")),
     )
     for role, item in dict(raw.get("assignments", {})).items():
         if not isinstance(item, dict):
@@ -277,3 +310,20 @@ def _string_list(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, str)]
+
+
+def _clarification_from_json(value: object) -> Clarification | None:
+    if not isinstance(value, dict):
+        return None
+    return Clarification(
+        status=str(value.get("status", "skipped")),
+        questions=_string_list(value.get("questions")),
+        assumptions=_string_list(value.get("assumptions")),
+        answers=_string_list(value.get("answers")),
+        raw_output=str(value.get("raw_output", "")),
+    )
+
+
+def _ask_question(question: str) -> str:
+    print(question)
+    return input("> ").strip()
