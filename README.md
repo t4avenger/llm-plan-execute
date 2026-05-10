@@ -27,7 +27,7 @@ uv run llm-plan-execute --dry-run build --run-dir .llm-plan-execute/runs/<run-id
 uv run llm-plan-execute --dry-run report --run-dir .llm-plan-execute/runs/<run-id>
 ```
 
-Dry-run mode is deterministic and never shells out to provider CLIs.
+Dry-run mode is deterministic, completes quickly, and never shells out to provider CLIs. Use it only for validation and demos.
 
 Create a local provider config:
 
@@ -37,6 +37,8 @@ uv run llm-plan-execute config validate
 ```
 
 Provider configs live at `.llm-plan-execute/config.json` and are intentionally local.
+
+Normal CLI usage requires a config file. If `.llm-plan-execute/config.json` is missing, commands such as `models`, `plan`, and `build` fail with guidance to run `init-config`, pass `--config`, or opt into `--dry-run`.
 
 ## Provider Setup
 
@@ -94,6 +96,8 @@ Codex is invoked as `codex exec --model <model> --cd <workspace> <prompt>`. Curs
 
 Common failure modes:
 
+- `plan` completes in milliseconds and produces generic output: you are using `--dry-run` or a config with `"dry_run": true`; remove dry-run mode and validate provider CLI setup.
+- `models` reports a missing config: run `llm-plan-execute init-config`, edit `.llm-plan-execute/config.json`, then run `llm-plan-execute config validate`.
 - `config validate` reports an unsupported provider, duplicate model id, invalid role, or score outside `1..5`: fix `.llm-plan-execute/config.json`.
 - `config validate` reports a missing command: install the provider CLI or set that provider to `"enabled": false`.
 - `models` reports no available models: use `--dry-run`, enable at least one installed provider, or add models with roles that match the workflow.

@@ -134,9 +134,13 @@ def load_config(path: Path | None, *, dry_run: bool = False) -> AppConfig:
     config_path = path or DEFAULT_CONFIG
     if config_path.exists():
         raw = json.loads(config_path.read_text(encoding="utf-8"))
-    else:
+    elif dry_run:
         raw = sample_config()
         raw["dry_run"] = True
+    else:
+        raise ValueError(
+            f"Config file {config_path} was not found. Run init-config, pass --config, or use --dry-run explicitly."
+        )
 
     validation = validate_config_data(raw, require_providers=not bool(raw.get("dry_run", False) or dry_run))
     if validation.errors:
@@ -189,9 +193,20 @@ def validate_config_file(path: Path | None, *, dry_run: bool = False) -> ConfigV
                 errors=(ConfigIssue("error", str(config_path), f"invalid JSON: {exc}"),),
                 warnings=(),
             )
-    else:
+    elif dry_run:
         raw = sample_config()
         raw["dry_run"] = True
+    else:
+        return ConfigValidation(
+            errors=(
+                ConfigIssue(
+                    "error",
+                    str(config_path),
+                    "config file was not found; run init-config, pass --config, or use --dry-run explicitly",
+                ),
+            ),
+            warnings=(),
+        )
     return validate_config_data(raw, require_providers=not bool(raw.get("dry_run", False) or dry_run))
 
 
