@@ -17,6 +17,9 @@ from .config import (
     ExecutionConfig,
     format_validation,
     load_config,
+    normalize_writable_dirs,
+    resolve_repo,
+    resolve_workspace_relative_path,
     validate_config_file,
     write_sample_config,
 )
@@ -46,6 +49,13 @@ from .workflow import (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="llm-plan-execute")
+    parser.add_argument(
+        "--repo",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Workspace root to plan, build, or configure (default: current directory).",
+    )
     parser.add_argument("--config", type=Path, default=None, help="Path to config JSON.")
     parser.add_argument("--dry-run", action="store_true", help="Use simulated providers and models.")
     parser.add_argument("--quiet", action="store_true", help="Suppress progress output.")
@@ -89,21 +99,22 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     try:
         return _run(argv)
-    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
+    except (KeyError, OSError, TypeError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
 
 def _run(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    workspace = resolve_repo(args.repo)
 
     if args.command == "init-config":
-        return _cmd_init_config(args)
+        return _cmd_init_config(args, workspace)
 
     if args.command == "config":
-        return _cmd_config(args)
+        return _cmd_config(args, workspace)
 
-    app_config = load_config(args.config, dry_run=args.dry_run)
+    app_config = load_config(args.config, workspace=workspace, dry_run=args.dry_run)
     router = ProviderRouter.from_config(app_config)
     progress = ProgressReporter(enabled=not args.quiet, verbose=args.verbose, stream=sys.stderr)
 
@@ -118,11 +129,11 @@ def _dispatch_command(
 ) -> int:
     handlers = {
         "models": lambda: _cmd_models(router),
-        "plan": lambda: _cmd_plan(args, router, app_config.runs_dir, app_config.execution, progress),
-        "run": lambda: _cmd_run(args, router, app_config.runs_dir, app_config.execution, progress),
-        "build": lambda: _cmd_build(args, router, app_config.execution, progress),
-        "accept": lambda: _cmd_accept(args),
-        "report": lambda: _cmd_report(args),
+        "plan": lambda: _cmd_plan(args, router, app_config, progress),
+        "run": lambda: _cmd_run(args, router, app_config, progress),
+        "build": lambda: _cmd_build(args, router, app_config, progress),
+        "accept": lambda: _cmd_accept(args, app_config),
+        "report": lambda: _cmd_report(args, app_config),
     }
     handler = handlers.get(args.command)
     return handler() if handler else 1
@@ -144,22 +155,23 @@ def _add_permission_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _cmd_init_config(args: argparse.Namespace) -> int:
-    path = write_sample_config(args.path)
+def _cmd_init_config(args: argparse.Namespace, workspace: Path) -> int:
+    output = resolve_workspace_relative_path(workspace, args.path)
+    path = write_sample_config(output)
     print(f"Wrote {path}")
     return 0
 
 
-def _cmd_config(args: argparse.Namespace) -> int:
+def _cmd_config(args: argparse.Namespace, workspace: Path) -> int:
     if args.config_command != "validate":
         return 1
 
-    validation = validate_config_file(args.config, dry_run=args.dry_run)
+    validation = validate_config_file(args.config, workspace=workspace, dry_run=args.dry_run)
     if validation.errors:
         print(format_validation(validation), file=sys.stderr)
         return 1
 
-    config = load_config(args.config, dry_run=args.dry_run)
+    config = load_config(args.config, workspace=workspace, dry_run=args.dry_run)
     command_errors: list[ConfigIssue] = []
     if not config.dry_run:
         command_errors = [
@@ -210,16 +222,15 @@ def _cmd_models(router: ProviderRouter) -> int:
 def _cmd_plan(
     args: argparse.Namespace,
     router: ProviderRouter,
-    runs_dir: Path,
-    execution: ExecutionConfig,
+    app_config: AppConfig,
     progress: ProgressReporter,
 ) -> int:
-    prompt = _read_prompt(args.prompt, args.prompt_file)
-    execution = _execution_with_cli_dirs(execution, args.writable_dir)
+    prompt = _read_prompt(app_config.workspace, args.prompt, args.prompt_file)
+    execution = _execution_with_cli_dirs(app_config.workspace, app_config.execution, args.writable_dir)
     if args.no_clarify:
         run = run_planning(
             prompt,
-            runs_dir,
+            app_config.runs_dir,
             router,
             auto_accept=args.yes,
             execution=execution,
@@ -229,7 +240,7 @@ def _cmd_plan(
     else:
         run = run_clarification(
             prompt,
-            runs_dir,
+            app_config.runs_dir,
             router,
             execution=execution,
             permission_mode=args.permission_mode,
@@ -271,16 +282,15 @@ def _cmd_plan(
 def _cmd_run(
     args: argparse.Namespace,
     router: ProviderRouter,
-    runs_dir: Path,
-    execution: ExecutionConfig,
+    app_config: AppConfig,
     progress: ProgressReporter,
 ) -> int:
-    prompt = _read_prompt(args.prompt, args.prompt_file)
-    execution = _execution_with_cli_dirs(execution, args.writable_dir)
+    prompt = _read_prompt(app_config.workspace, args.prompt, args.prompt_file)
+    execution = _execution_with_cli_dirs(app_config.workspace, app_config.execution, args.writable_dir)
     if args.no_clarify:
         run = run_planning(
             prompt,
-            runs_dir,
+            app_config.runs_dir,
             router,
             auto_accept=False,
             execution=execution,
@@ -290,7 +300,7 @@ def _cmd_run(
     else:
         run = run_clarification(
             prompt,
-            runs_dir,
+            app_config.runs_dir,
             router,
             execution=execution,
             permission_mode=args.permission_mode,
@@ -344,6 +354,7 @@ def _cmd_run(
             execution=execution,
             permission_mode=build_permission_mode,
             progress=progress.update,
+            runs_root=app_config.runs_dir,
         )
     except BuildFailedError as exc:
         run = exc.run
@@ -357,9 +368,10 @@ def _cmd_run(
     return 0
 
 
-def _cmd_accept(args: argparse.Namespace) -> int:
-    raw = load_state(args.run_dir)
-    run = _state_from_json(raw, args.run_dir)
+def _cmd_accept(args: argparse.Namespace, app_config: AppConfig) -> int:
+    run_dir = resolve_workspace_relative_path(app_config.workspace, args.run_dir)
+    raw = load_state(run_dir)
+    run = _state_from_json(raw, run_dir)
     run = accept_plan(run)
     print(f"Accepted plan: {run.run_dir / '04-accepted-plan.md'}")
     print(f"Build with: llm-plan-execute build --run-dir {run.run_dir}")
@@ -370,12 +382,13 @@ def _cmd_accept(args: argparse.Namespace) -> int:
 def _cmd_build(
     args: argparse.Namespace,
     router: ProviderRouter,
-    execution: ExecutionConfig,
+    app_config: AppConfig,
     progress: ProgressReporter,
 ) -> int:
-    raw = load_state(args.run_dir)
-    run = _state_from_json(raw, args.run_dir)
-    execution = _execution_with_cli_dirs(execution, args.writable_dir)
+    run_dir = resolve_workspace_relative_path(app_config.workspace, args.run_dir)
+    raw = load_state(run_dir)
+    run = _state_from_json(raw, run_dir)
+    execution = _execution_with_cli_dirs(app_config.workspace, app_config.execution, args.writable_dir)
     try:
         run = run_build(
             run,
@@ -383,6 +396,7 @@ def _cmd_build(
             execution=execution,
             permission_mode=args.permission_mode,
             progress=progress.update,
+            runs_root=app_config.runs_dir,
         )
     except BuildFailedError as exc:
         run = exc.run
@@ -395,18 +409,20 @@ def _cmd_build(
     return 0
 
 
-def _cmd_report(args: argparse.Namespace) -> int:
-    raw = load_state(args.run_dir)
-    run = _state_from_json(raw, args.run_dir)
+def _cmd_report(args: argparse.Namespace, app_config: AppConfig) -> int:
+    run_dir = resolve_workspace_relative_path(app_config.workspace, args.run_dir)
+    raw = load_state(run_dir)
+    run = _state_from_json(raw, run_dir)
     print(render_report(run), end="")
     return 0
 
 
-def _read_prompt(prompt: str | None, prompt_file: Path | None) -> str:
+def _read_prompt(workspace: Path, prompt: str | None, prompt_file: Path | None) -> str:
     if prompt:
         return prompt
     if prompt_file:
-        return prompt_file.read_text(encoding="utf-8")
+        path = resolve_workspace_relative_path(workspace, prompt_file)
+        return path.read_text(encoding="utf-8")
     raise SystemExit("Provide --prompt or --prompt-file.")
 
 
@@ -550,15 +566,20 @@ def _execution_policies_from_json(value: object) -> dict[str, ExecutionPolicy]:
     return policies
 
 
-def _execution_with_cli_dirs(execution: ExecutionConfig, writable_dirs: list[Path]) -> ExecutionConfig:
+def _execution_with_cli_dirs(
+    workspace: Path,
+    execution: ExecutionConfig,
+    writable_dirs: list[Path],
+) -> ExecutionConfig:
     if not writable_dirs:
         return execution
+    extra = normalize_writable_dirs(workspace, tuple(writable_dirs), field="--writable-dir")
     return ExecutionConfig(
         default_mode=execution.default_mode,
         planning_mode=execution.planning_mode,
         review_mode=execution.review_mode,
         build_mode=execution.build_mode,
-        writable_dirs=(*execution.writable_dirs, *writable_dirs),
+        writable_dirs=(*execution.writable_dirs, *extra),
     )
 
 

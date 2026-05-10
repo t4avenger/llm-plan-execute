@@ -176,12 +176,13 @@ def run_build(
     execution: ExecutionConfig | None = None,
     permission_mode: str | None = None,
     progress: ProgressCallback | None = None,
+    runs_root: Path | None = None,
 ) -> RunState:
     if not existing.accepted_plan:
         raise ValueError("Run has no accepted plan. Review the proposed plan, then run the accept command.")
     _ensure_assignments(existing, router)
 
-    before_changes = _workspace_changes(router.workspace)
+    before_changes = _workspace_changes(router.workspace, exclude_runs_under=runs_root)
     build = _run_provider(
         existing,
         router,
@@ -194,7 +195,7 @@ def run_build(
     existing.results.append(build)
     existing.build_output = build.output
     write_text(existing, "05-build-output.md", build.output)
-    after_changes = _workspace_changes(router.workspace)
+    after_changes = _workspace_changes(router.workspace, exclude_runs_under=runs_root)
     failure = _build_failure(existing, build, before_changes, after_changes, router.dry_run)
     if failure:
         existing.build_status = "failed"
@@ -295,23 +296,51 @@ def _execution_policy(
     return (execution or ExecutionConfig()).policy_for_role(role, mode_override=permission_mode)
 
 
-def _workspace_changes(workspace: Path) -> str | None:
+def _git_exclude_pathspecs(workspace: Path, exclude_runs_under: Path | None) -> list[str]:
+    if exclude_runs_under is None:
+        return []
+    try:
+        rel = exclude_runs_under.resolve().relative_to(workspace.resolve())
+    except ValueError:
+        return []
+    if rel == Path("."):
+        return []
+    return [f":(exclude){rel.as_posix()}"]
+
+
+def _workspace_changes(workspace: Path, *, exclude_runs_under: Path | None = None) -> str | None:
     git = shutil.which("git")
     if git is None:
         return None
-    status = _git_output(git, workspace, ["status", "--porcelain=v1", "-z"])
-    staged_diff = _git_output(git, workspace, ["diff", "--cached", "--binary", "HEAD", "--"])
-    unstaged_diff = _git_output(git, workspace, ["diff", "--binary", "--"])
-    untracked = _git_output(git, workspace, ["ls-files", "--others", "--exclude-standard", "-z"])
+    exclude = _git_exclude_pathspecs(workspace, exclude_runs_under)
+    status = _git_output(git, workspace, ["status", "--porcelain=v1", "-z"], pathspec_excludes=exclude)
+    staged_diff = _git_output(git, workspace, ["diff", "--cached", "--binary", "HEAD", "--"], pathspec_excludes=exclude)
+    unstaged_diff = _git_output(git, workspace, ["diff", "--binary", "--"], pathspec_excludes=exclude)
+    untracked = _git_output(
+        git, workspace, ["ls-files", "--others", "--exclude-standard", "-z"], pathspec_excludes=exclude
+    )
     if status is None or staged_diff is None or unstaged_diff is None or untracked is None:
         return None
     return "\0".join((status, staged_diff, unstaged_diff, _untracked_file_hashes(workspace, untracked)))
 
 
-def _git_output(git: str, workspace: Path, args: list[str]) -> str | None:
+def _git_output(
+    git: str,
+    workspace: Path,
+    args: list[str],
+    *,
+    pathspec_excludes: list[str] | None = None,
+) -> str | None:
+    excludes = pathspec_excludes or []
+    if not excludes:
+        cmd = [git, *args]
+    elif args and args[-1] == "--":
+        cmd = [git, *args[:-1], "--", ".", *excludes]
+    else:
+        cmd = [git, *args, "--", ".", *excludes]
     try:
         completed = subprocess.run(  # noqa: S603 - fixed git executable with static arguments.
-            [git, *args],
+            cmd,
             cwd=workspace,
             text=True,
             capture_output=True,

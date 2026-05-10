@@ -166,26 +166,92 @@ def write_sample_config(path: Path = DEFAULT_CONFIG) -> Path:
     return path
 
 
-def load_config(path: Path | None, *, dry_run: bool = False) -> AppConfig:
-    config_path = path or DEFAULT_CONFIG
+def resolve_repo(repo: Path | None) -> Path:
+    """Resolve the workspace directory; defaults to the current working directory."""
+    candidate = (repo if repo is not None else Path.cwd()).expanduser()
+    resolved = candidate.resolve()
+    if not resolved.exists():
+        raise ValueError(f"Workspace {resolved} does not exist.")
+    if not resolved.is_dir():
+        raise ValueError(f"Workspace {resolved} is not a directory.")
+    return resolved
+
+
+def resolve_config_path(config_arg: Path | None, workspace: Path) -> Path:
+    """Resolve which config file to load: explicit --config wins, else workspace-local default."""
+    workspace = workspace.resolve()
+    if config_arg is not None:
+        config_arg = config_arg.expanduser()
+        return config_arg.resolve() if config_arg.is_absolute() else (workspace / config_arg).resolve()
+    return (workspace / DEFAULT_ROOT / "config.json").resolve()
+
+
+def resolve_workspace_relative_path(workspace: Path, path: Path) -> Path:
+    """Resolve a path that may be absolute or relative to workspace."""
+    workspace = workspace.resolve()
+    path = path.expanduser()
+    return path.resolve() if path.is_absolute() else (workspace / path).resolve()
+
+
+def _must_live_under_workspace(workspace: Path, resolved: Path, *, field: str, original: Path) -> Path:
+    ws = workspace.resolve()
+    try:
+        resolved.relative_to(ws)
+    except ValueError as exc:
+        raise ValueError(
+            f"{field}: path {original} resolves outside workspace {ws}; choose a path inside the workspace."
+        ) from exc
+    return resolved
+
+
+def normalize_runs_dir(workspace: Path, runs_dir: Path) -> Path:
+    workspace = workspace.resolve()
+    runs_dir = runs_dir.expanduser()
+    candidate = runs_dir if runs_dir.is_absolute() else workspace / runs_dir
+    resolved = candidate.resolve()  # NOSONAR - validated against the resolved workspace before use.
+    return _must_live_under_workspace(workspace, resolved, field="runs_dir", original=runs_dir)
+
+
+def normalize_writable_dirs(workspace: Path, paths: tuple[Path, ...], *, field: str) -> tuple[Path, ...]:
+    normalized: list[Path] = []
+    workspace = workspace.resolve()
+    for index, path in enumerate(paths):
+        expanded = path.expanduser()
+        if expanded.is_absolute():
+            normalized.append(expanded.resolve())
+            continue
+        resolved = (workspace / expanded).resolve()
+        normalized.append(_must_live_under_workspace(workspace, resolved, field=f"{field}[{index}]", original=expanded))
+    return tuple(normalized)
+
+
+def load_config(config_arg: Path | None, *, workspace: Path, dry_run: bool = False) -> AppConfig:
+    workspace = workspace.resolve()
+    config_path = resolve_config_path(config_arg, workspace)
     if config_path.exists():
         raw = json.loads(config_path.read_text(encoding="utf-8"))
     elif dry_run:
         raw = sample_config()
         raw["dry_run"] = True
-    else:
+    elif config_arg is not None:
         raise ValueError(
             f"Config file {config_path} was not found. Run init-config, pass --config, or use --dry-run explicitly."
+        )
+    else:
+        raise ValueError(
+            f"Config file {config_path} was not found for workspace {workspace}. "
+            "Run init-config, pass --config, or use --dry-run explicitly."
         )
 
     validation = validate_config_data(raw, require_providers=not bool(raw.get("dry_run", False) or dry_run))
     if validation.errors:
         raise ValueError(format_validation(validation))
 
-    return parse_config(raw, dry_run=dry_run)
+    return parse_config(raw, workspace=workspace, dry_run=dry_run)
 
 
-def parse_config(raw: dict[str, Any], *, dry_run: bool = False) -> AppConfig:
+def parse_config(raw: dict[str, Any], *, workspace: Path, dry_run: bool = False) -> AppConfig:
+    workspace = workspace.resolve()
     providers: list[ProviderConfig] = []
     for provider in raw.get("providers", []):
         models: list[ModelInfo] = []
@@ -211,16 +277,19 @@ def parse_config(raw: dict[str, Any], *, dry_run: bool = False) -> AppConfig:
             )
         )
 
+    runs_dir = normalize_runs_dir(workspace, Path(raw.get("runs_dir", ".llm-plan-execute/runs")))
+    execution = _parse_execution(raw.get("execution", {}), workspace)
+
     return AppConfig(
         providers=tuple(providers),
-        runs_dir=Path(raw.get("runs_dir", ".llm-plan-execute/runs")),
+        runs_dir=runs_dir,
         dry_run=bool(raw.get("dry_run", False) or dry_run),
-        workspace=Path(raw.get("workspace", ".")),
-        execution=_parse_execution(raw.get("execution", {})),
+        workspace=workspace,
+        execution=execution,
     )
 
 
-def _parse_execution(raw: object) -> ExecutionConfig:
+def _parse_execution(raw: object, workspace: Path) -> ExecutionConfig:
     if not isinstance(raw, dict):
         return ExecutionConfig()
     phases = raw.get("phases", {})
@@ -230,17 +299,20 @@ def _parse_execution(raw: object) -> ExecutionConfig:
     if not isinstance(writable_dirs, list):
         writable_dirs = []
     default_mode = str(raw.get("default_mode", "workspace-write"))
+    paths = tuple(Path(path) for path in writable_dirs if isinstance(path, str))
+    normalized = normalize_writable_dirs(workspace, paths, field="execution.writable_dirs")
     return ExecutionConfig(
         default_mode=default_mode,
         planning_mode=str(phases.get("planning", "read-only")),
         review_mode=str(phases.get("review", "read-only")),
         build_mode=str(phases.get("build", default_mode)),
-        writable_dirs=tuple(Path(path) for path in writable_dirs if isinstance(path, str)),
+        writable_dirs=normalized,
     )
 
 
-def validate_config_file(path: Path | None, *, dry_run: bool = False) -> ConfigValidation:
-    config_path = path or DEFAULT_CONFIG
+def validate_config_file(config_arg: Path | None, *, workspace: Path, dry_run: bool = False) -> ConfigValidation:
+    workspace = workspace.resolve()
+    config_path = resolve_config_path(config_arg, workspace)
     if config_path.exists():
         try:
             raw = json.loads(config_path.read_text(encoding="utf-8"))

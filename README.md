@@ -11,13 +11,22 @@ The project provides:
 
 ## Quick Start
 
-Install dependencies:
+Install dependencies for development:
 
 ```bash
 uv sync --dev
 ```
 
-Run the workflow with simulated providers:
+Install the CLI into an isolated environment for day-to-day use (recommended):
+
+```bash
+pipx install .
+llm-plan-execute --help
+llm-plan-execute plan
+llm-plan-execute --repo /path/to/other/repo plan
+```
+
+Run the workflow with simulated providers from a development checkout:
 
 ```bash
 uv run llm-plan-execute --dry-run run --prompt "Add a small feature"
@@ -33,7 +42,23 @@ uv run llm-plan-execute init-config
 uv run llm-plan-execute config validate
 ```
 
-Provider configs live at `.llm-plan-execute/config.json` and are intentionally local.
+### Workspace and `--repo`
+
+The CLI separates **installed application code** from the **workspace** you are planning or building against.
+
+- **`--repo PATH`** selects that workspace for every command (`plan`, `run`, `accept`, `build`, `report`, `models`, `config`, `init-config`). It defaults to the current working directory and is normalized once with `Path.resolve()` (symlinks are followed), so logs refer to a single deterministic absolute path.
+- **Config resolution**: `--config` wins if provided (absolute paths are used as-is; relative paths are resolved against the workspace). Otherwise the CLI reads `<workspace>/.llm-plan-execute/config.json`. A `workspace` string in the JSON file is documentation only; the process workspace is always the resolved `--repo` (or current directory).
+- **Paths inside config**: `runs_dir` and `execution.writable_dirs` entries may be absolute or workspace-relative; all `runs_dir` values and relative `writable_dirs` must resolve to paths inside the workspace. Use an absolute `writable_dirs` entry if you intentionally need to allow a directory outside the workspace.
+- **`--run-dir`**: relative values are resolved against the workspace; absolute paths are honored as-is.
+- **Workspace state** lives under `<workspace>/.llm-plan-execute/` (config, runs, and other artifacts). That directory is created only when writing config or run outputs. It is safe to delete except for history you want to keep. Add this to the target repository’s `.gitignore`:
+
+```gitignore
+.llm-plan-execute/
+```
+
+Run artifacts under the configured `runs_dir` are excluded from git-based workspace change detection so generated files do not look like user edits.
+
+Provider configs live at `.llm-plan-execute/config.json` (relative to the chosen workspace) and are intentionally local.
 `init-config` enables provider entries whose configured command is found on `PATH` and disables missing commands. For example, a machine with `codex` and `cursor-agent` installed will enable Codex and Cursor, while leaving Claude disabled if `claude` is absent. Cursor's default model is builder-only unless you explicitly add planning or review roles.
 
 Normal CLI usage requires a config file. If `.llm-plan-execute/config.json` is missing, commands such as `models`, `run`, `plan`, and `build` fail with guidance to run `init-config`, pass `--config`, or opt into `--dry-run`.
@@ -193,4 +218,4 @@ uv run pre-commit install
 uv run pre-commit run --all-files
 ```
 
-CI is split into `.github/workflows/quality.yml` for lint, format, tests, and pre-commit, and `.github/workflows/build.yml` for Sonar scanning.
+CI runs `.github/workflows/quality.yml` for lint, format, tests, and pre-commit; `.github/workflows/package.yml` builds wheels and source distributions in clean virtual environments on Linux, macOS, and Windows (Python 3.11–3.13) and smoke-tests the installed `llm-plan-execute` entry point without relying on `PYTHONPATH`; and `.github/workflows/build.yml` runs Sonar scanning.

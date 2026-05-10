@@ -26,6 +26,10 @@ def _write_dry_config(tmp_path: Path) -> Path:
     return config
 
 
+def _config_args(tmp_path: Path, config: Path) -> list[str]:
+    return ["--repo", str(tmp_path), "--config", str(config)]
+
+
 def test_state_from_json_ignores_malformed_string_lists(tmp_path):
     run = _state_from_json(
         {
@@ -91,7 +95,7 @@ def test_missing_config_requires_init_config_or_dry_run(tmp_path, capsys, monkey
 
     captured = capsys.readouterr()
     assert exit_code == 1
-    assert "Config file .llm-plan-execute/config.json was not found" in captured.err
+    assert "was not found for workspace" in captured.err
     assert "use --dry-run explicitly" in captured.err
 
 
@@ -256,7 +260,7 @@ def test_dry_run_allows_empty_provider_list(tmp_path, capsys):
 def test_plan_without_clarify_prints_accept_command(tmp_path, capsys):
     config = _write_dry_config(tmp_path)
 
-    exit_code = main(["--config", str(config), "plan", "--prompt", "Add a small feature", "--no-clarify"])
+    exit_code = main([*_config_args(tmp_path, config), "plan", "--prompt", "Add a small feature", "--no-clarify"])
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -267,7 +271,7 @@ def test_plan_without_clarify_prints_accept_command(tmp_path, capsys):
 def test_plan_prints_clear_clarification_status(tmp_path, capsys):
     config = _write_dry_config(tmp_path)
 
-    exit_code = main(["--config", str(config), "plan", "--prompt", "Add a small feature"])
+    exit_code = main([*_config_args(tmp_path, config), "plan", "--prompt", "Add a small feature"])
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -277,12 +281,12 @@ def test_plan_prints_clear_clarification_status(tmp_path, capsys):
 
 def test_accept_command_promotes_plan(tmp_path, capsys):
     config = _write_dry_config(tmp_path)
-    main(["--config", str(config), "plan", "--prompt", "Add a small feature", "--no-clarify"])
+    main([*_config_args(tmp_path, config), "plan", "--prompt", "Add a small feature", "--no-clarify"])
     captured = capsys.readouterr()
     run_line = next(line for line in captured.out.splitlines() if line.startswith("Run:"))
     run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
 
-    exit_code = main(["--config", str(config), "accept", "--run-dir", str(run_dir)])
+    exit_code = main([*_config_args(tmp_path, config), "accept", "--run-dir", str(run_dir)])
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -294,7 +298,7 @@ def test_noninteractive_clarification_exits_before_plan(tmp_path, capsys, monkey
     config = _write_dry_config(tmp_path)
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
 
-    exit_code = main(["--config", str(config), "plan", "--prompt", "Do an ambiguous thing"])
+    exit_code = main([*_config_args(tmp_path, config), "plan", "--prompt", "Do an ambiguous thing"])
 
     captured = capsys.readouterr()
     assert exit_code == CLARIFICATION_NEEDED_EXIT
@@ -310,7 +314,7 @@ def test_interactive_clarification_marks_answered_questions_clear(tmp_path, caps
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _prompt: "Implement the requested behavior.")
 
-    exit_code = main(["--config", str(config), "plan", "--prompt", "Do an ambiguous thing"])
+    exit_code = main([*_config_args(tmp_path, config), "plan", "--prompt", "Do an ambiguous thing"])
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -325,12 +329,12 @@ def test_interactive_clarification_marks_answered_questions_clear(tmp_path, caps
 
 def test_build_unaccepted_run_reports_accept_guidance(tmp_path, capsys):
     config = _write_dry_config(tmp_path)
-    main(["--config", str(config), "plan", "--prompt", "Add a small feature", "--no-clarify"])
+    main([*_config_args(tmp_path, config), "plan", "--prompt", "Add a small feature", "--no-clarify"])
     captured = capsys.readouterr()
     run_line = next(line for line in captured.out.splitlines() if line.startswith("Run:"))
     run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
 
-    exit_code = main(["--config", str(config), "build", "--run-dir", str(run_dir)])
+    exit_code = main([*_config_args(tmp_path, config), "build", "--run-dir", str(run_dir)])
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -342,7 +346,7 @@ def test_run_save_only_stops_before_build(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _prompt: "save-only")
 
-    exit_code = main(["--config", str(config), "run", "--prompt", "Add a small feature", "--no-clarify"])
+    exit_code = main([*_config_args(tmp_path, config), "run", "--prompt", "Add a small feature", "--no-clarify"])
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -358,7 +362,7 @@ def test_run_approve_builds_after_inline_plan_review(tmp_path, capsys, monkeypat
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _prompt: "approve")
 
-    exit_code = main(["--config", str(config), "run", "--prompt", "Add a small feature", "--no-clarify"])
+    exit_code = main([*_config_args(tmp_path, config), "run", "--prompt", "Add a small feature", "--no-clarify"])
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -371,12 +375,14 @@ def test_run_approve_builds_after_inline_plan_review(tmp_path, capsys, monkeypat
 
 def test_build_permission_mode_is_recorded(tmp_path, capsys):
     config = _write_dry_config(tmp_path)
-    main(["--config", str(config), "plan", "--prompt", "Add a small feature", "--no-clarify", "--yes"])
+    main([*_config_args(tmp_path, config), "plan", "--prompt", "Add a small feature", "--no-clarify", "--yes"])
     captured = capsys.readouterr()
     run_line = next(line for line in captured.out.splitlines() if line.startswith("Run:"))
     run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
 
-    exit_code = main(["--config", str(config), "build", "--run-dir", str(run_dir), "--permission-mode", "full-access"])
+    exit_code = main(
+        [*_config_args(tmp_path, config), "build", "--run-dir", str(run_dir), "--permission-mode", "full-access"]
+    )
 
     capsys.readouterr()
     assert exit_code == 0
@@ -389,7 +395,7 @@ def test_run_cancel_stops_before_build(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("builtins.input", lambda _prompt: "cancel")
 
-    exit_code = main(["--config", str(config), "run", "--prompt", "Add a small feature", "--no-clarify"])
+    exit_code = main([*_config_args(tmp_path, config), "run", "--prompt", "Add a small feature", "--no-clarify"])
 
     captured = capsys.readouterr()
     assert exit_code == CANCELED_EXIT
@@ -399,7 +405,9 @@ def test_run_cancel_stops_before_build(tmp_path, capsys, monkeypatch):
 def test_quiet_suppresses_progress(tmp_path, capsys):
     config = _write_dry_config(tmp_path)
 
-    exit_code = main(["--config", str(config), "--quiet", "plan", "--prompt", "Add a small feature", "--no-clarify"])
+    exit_code = main(
+        [*_config_args(tmp_path, config), "--quiet", "plan", "--prompt", "Add a small feature", "--no-clarify"]
+    )
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -410,7 +418,7 @@ def test_quiet_suppresses_progress(tmp_path, capsys):
 def test_progress_uses_stderr_and_leaves_stdout_clean(tmp_path, capsys):
     config = _write_dry_config(tmp_path)
 
-    exit_code = main(["--config", str(config), "plan", "--prompt", "Add a small feature", "--no-clarify"])
+    exit_code = main([*_config_args(tmp_path, config), "plan", "--prompt", "Add a small feature", "--no-clarify"])
 
     captured = capsys.readouterr()
     assert exit_code == 0
