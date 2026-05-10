@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-plan-execute"
+version = "0.1.0"
+description = "Multi-provider planning, build, review, and reporting orchestrator for LLM coding agents."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "llm-plan-execute contributors" }]
+dependencies = []
+
+[project.scripts]
+llm-plan-execute = "llm_plan_execute.cli:main"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.2.0",
+    "pytest>=8.3.5",
+    "ruff>=0.11.10",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "ARG",  # unused arguments
+    "B",    # flake8-bugbear
+    "C4",   # comprehensions
+    "C90",  # McCabe complexity
+    "E",    # pycodestyle errors
+    "F",    # Pyflakes
+    "I",    # import sorting
+    "N",    # naming
+    "PL",   # Pylint rules
+    "PT",   # pytest style
+    "RET",  # returns
+    "RUF",  # Ruff-specific rules
+    "S",    # flake8-bandit security checks
+    "SIM",  # simplification
+    "UP",   # pyupgrade
+    "W",    # pycodestyle warnings
+]
+ignore = [
+    "PLR0913", # dataclass-style constructors can legitimately carry several fields
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 8
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
