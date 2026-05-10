@@ -14,7 +14,7 @@ from .prompts import (
 from .providers import ProviderRouter
 from .reporting import render_report
 from .selection import assign_models
-from .types import RunState
+from .types import ROLES, RunState
 
 
 def run_planning(prompt: str, runs_dir: Path, router: ProviderRouter, *, auto_accept: bool) -> RunState:
@@ -48,12 +48,11 @@ def run_planning(prompt: str, runs_dir: Path, router: ProviderRouter, *, auto_ac
         plan_arbiter_prompt(planner.output, review_a.output, review_b.output),
     )
     run.results.append(arbiter)
-    run.accepted_plan = arbiter.output
-    write_text(run, "04-accepted-plan.md", run.accepted_plan)
-
-    if not auto_accept:
-        print("\nPlan summary written to:", run.run_dir / "04-accepted-plan.md")
-        print("Open the plan, then rerun with build when ready. Non-interactive v1 uses --yes to accept.")
+    if auto_accept:
+        run.accepted_plan = arbiter.output
+        write_text(run, "04-accepted-plan.md", run.accepted_plan)
+    else:
+        write_text(run, "04-proposed-plan.md", arbiter.output)
 
     write_state(run)
     report = render_report(run)
@@ -63,11 +62,8 @@ def run_planning(prompt: str, runs_dir: Path, router: ProviderRouter, *, auto_ac
 
 def run_build(existing: RunState, router: ProviderRouter) -> RunState:
     if not existing.accepted_plan:
-        raise ValueError("Run has no accepted plan. Run the plan command first.")
-    if not existing.assignments:
-        assignments, warnings = assign_models(router.available_models())
-        existing.assignments = assignments
-        existing.warnings.extend(warnings)
+        raise ValueError("Run has no accepted plan. Run the plan command with --yes before building.")
+    _ensure_assignments(existing, router)
 
     build = router.run("builder", existing.assignments["builder"].model, build_prompt(existing.accepted_plan))
     existing.results.append(build)
@@ -104,3 +100,14 @@ def run_build(existing: RunState, router: ProviderRouter) -> RunState:
     write_state(existing)
     write_text(existing, "report.md", render_report(existing))
     return existing
+
+
+def _ensure_assignments(existing: RunState, router: ProviderRouter) -> None:
+    missing_roles = [role for role in ROLES if role not in existing.assignments]
+    if not missing_roles:
+        return
+    assignments, warnings = assign_models(router.available_models())
+    for role in missing_roles:
+        existing.assignments[role] = assignments[role]
+    existing.warnings.extend(warnings)
+    existing.warnings.append(f"Filled missing model assignments for roles: {', '.join(missing_roles)}.")

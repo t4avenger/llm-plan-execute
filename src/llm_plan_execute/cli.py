@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _run(argv)
+    except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _run(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.command == "init-config":
@@ -91,7 +100,11 @@ def _cmd_plan(args: argparse.Namespace, router: ProviderRouter, runs_dir: Path) 
     prompt = _read_prompt(args.prompt, args.prompt_file)
     run = run_planning(prompt, runs_dir, router, auto_accept=args.yes)
     print(f"Run: {run.run_id}")
-    print(f"Accepted plan: {run.run_dir / '04-accepted-plan.md'}")
+    if args.yes:
+        print(f"Accepted plan: {run.run_dir / '04-accepted-plan.md'}")
+    else:
+        print(f"Proposed plan: {run.run_dir / '04-proposed-plan.md'}")
+        print("Rerun planning with --yes when you want this run to be buildable.")
     print(f"Report: {run.run_dir / 'report.md'}")
     return 0
 
@@ -140,8 +153,8 @@ def _state_from_json(raw: dict[str, object], run_dir: Path) -> RunState:
         created_at=str(raw.get("created_at", "")),
         accepted_plan=raw.get("accepted_plan") if isinstance(raw.get("accepted_plan"), str) else None,
         build_output=raw.get("build_output") if isinstance(raw.get("build_output"), str) else None,
-        warnings=list(raw.get("warnings", [])),
-        next_options=list(raw.get("next_options", [])),
+        warnings=_string_list(raw.get("warnings")),
+        next_options=_string_list(raw.get("next_options")),
     )
     for role, item in dict(raw.get("assignments", {})).items():
         if not isinstance(item, dict):
@@ -200,3 +213,9 @@ def _optional_float(value: object) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]

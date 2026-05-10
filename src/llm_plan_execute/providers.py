@@ -82,9 +82,12 @@ class CLIProvider(Provider):
                 timeout=1800,
             )
             output = completed.stdout.strip()
-            error = completed.stderr.strip() if completed.returncode else None
-            if not output and error:
-                output = f"Provider returned no stdout. stderr:\n{error}"
+            stderr = completed.stderr.strip() or None
+            error = _process_error(completed.returncode, stderr)
+            if not output and stderr:
+                output = f"Provider returned no stdout. stderr:\n{stderr}"
+            elif not output and error:
+                output = f"Provider returned no stdout. {error}"
             usage.output_tokens = estimate_tokens(output)
             usage.cost_usd = estimate_cost(model, usage)
             return ProviderResult(role, model, prompt, output, usage, time.monotonic() - start, error)
@@ -118,6 +121,14 @@ class ProviderRouter:
             if any(candidate.id == model.id for candidate in provider.available_models()):
                 return provider.run(role, model, prompt)
         raise ValueError(f"No provider can run selected model {model.id}")
+
+
+def _process_error(returncode: int, stderr: str | None) -> str | None:
+    if returncode == 0:
+        return None
+    if stderr:
+        return f"Provider exited with code {returncode}: {stderr}"
+    return f"Provider exited with code {returncode}"
 
 
 def dry_response(role: str, prompt: str) -> str:
