@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from .config import AppConfig, ProviderConfig
 from .types import ModelInfo, ProviderResult, Usage
@@ -60,22 +61,101 @@ class DryRunProvider(Provider):
         return ProviderResult(role, model, prompt, output, usage, time.monotonic() - start)
 
 
+@dataclass(frozen=True)
+class ProviderCommand:
+    args: list[str]
+    cwd: Path
+
+
+class ProviderAdapter:
+    def build_command(self, config: ProviderConfig, model: ModelInfo, prompt: str, workspace: Path) -> ProviderCommand:
+        raise NotImplementedError
+
+
+class CodexAdapter(ProviderAdapter):
+    def build_command(self, config: ProviderConfig, model: ModelInfo, prompt: str, workspace: Path) -> ProviderCommand:
+        resolved_workspace = workspace.resolve()
+        return ProviderCommand(
+            [
+                config.command,
+                "exec",
+                "--model",
+                model.name,
+                "--cd",
+                str(resolved_workspace),
+                prompt,
+            ],
+            resolved_workspace,
+        )
+
+
+class CursorAdapter(ProviderAdapter):
+    def build_command(self, config: ProviderConfig, model: ModelInfo, prompt: str, workspace: Path) -> ProviderCommand:
+        resolved_workspace = workspace.resolve()
+        return ProviderCommand(
+            [
+                config.command,
+                "--print",
+                "--output-format",
+                "text",
+                "--model",
+                model.name,
+                "--workspace",
+                str(resolved_workspace),
+                "--trust",
+                prompt,
+            ],
+            resolved_workspace,
+        )
+
+
+class ClaudeAdapter(ProviderAdapter):
+    def build_command(self, config: ProviderConfig, model: ModelInfo, prompt: str, workspace: Path) -> ProviderCommand:
+        resolved_workspace = workspace.resolve()
+        return ProviderCommand([config.command, "--model", model.name, prompt], resolved_workspace)
+
+
+ADAPTERS: dict[str, ProviderAdapter] = {
+    "codex": CodexAdapter(),
+    "cursor": CursorAdapter(),
+    "claude": ClaudeAdapter(),
+}
+
+
 @dataclass
 class CLIProvider(Provider):
     config: ProviderConfig
+    workspace: Path = Path(".")
+
+    @property
+    def adapter(self) -> ProviderAdapter | None:
+        return ADAPTERS.get(self.config.name)
 
     def available_models(self) -> list[ModelInfo]:
-        if not self.config.enabled or shutil.which(self.config.command) is None:
+        if not self.config.enabled or self.adapter is None or shutil.which(self.config.command) is None:
             return []
         return list(self.config.models)
 
     def run(self, role: str, model: ModelInfo, prompt: str) -> ProviderResult:
         start = time.monotonic()
         usage = Usage(input_tokens=estimate_tokens(prompt), exact=False, confidence="estimated")
+        adapter = self.adapter
+        if adapter is None:
+            output = f"No adapter is registered for provider {self.config.name!r}."
+            usage.output_tokens = estimate_tokens(output)
+            usage.cost_usd = estimate_cost(model, usage)
+            return ProviderResult(role, model, prompt, output, usage, time.monotonic() - start, output)
+        if shutil.which(self.config.command) is None:
+            error = f"Provider command {self.config.command!r} is not available on PATH."
+            usage.output_tokens = estimate_tokens(error)
+            usage.cost_usd = estimate_cost(model, usage)
+            return ProviderResult(role, model, prompt, error, usage, time.monotonic() - start, error)
+
+        provider_command = adapter.build_command(self.config, model, prompt, self.workspace)
         try:
             completed = subprocess.run(  # noqa: S603 - provider command is explicit user config, never a shell.
-                [self.config.command, "--model", model.name],
-                input=prompt,
+                provider_command.args,
+                cwd=provider_command.cwd,
                 text=True,
                 capture_output=True,
                 check=False,
@@ -107,7 +187,7 @@ class ProviderRouter:
         if config.dry_run:
             return cls([DryRunProvider()])
         providers: list[Provider] = []
-        providers.extend(CLIProvider(provider) for provider in config.providers)
+        providers.extend(CLIProvider(provider, workspace=config.workspace) for provider in config.providers)
         return cls(providers)
 
     def available_models(self) -> list[ModelInfo]:
