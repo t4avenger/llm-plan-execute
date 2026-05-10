@@ -78,6 +78,47 @@ def test_unclosed_embedded_marker_does_not_raise():
     assert isinstance(recs, list)
 
 
+def test_malformed_embedded_json_falls_back_to_heading_blocks():
+    md = """<!-- llm-plan-execute:recommendations
+not json
+-->
+
+### First
+Fix one.
+
+### Second
+Fix two.
+"""
+
+    recs = parse_recommendations_from_summary(md)
+
+    assert [rec.id for rec in recs] == ["heading-1", "heading-2"]
+    assert recs[0].title == "First"
+    assert recs[0].description == "Fix one."
+
+
+def test_invalid_embedded_items_are_ignored():
+    payload = json.dumps(
+        [
+            "not an object",
+            {"id": 1, "title": "bad"},
+            {"id": "ok", "title": "Good", "description": "desc", "depends_on": ["base", 3]},
+        ]
+    )
+
+    recs = parse_recommendations_from_summary(f"<!-- llm-plan-execute:recommendations\n{payload}\n-->")
+
+    assert recs == [
+        BuildRecommendation(id="ok", title="Good", description="desc", status="applicable", depends_on=("base", "3"))
+    ]
+
+
+def test_single_heading_falls_back_to_bullet_findings():
+    recs = parse_recommendations_from_summary("### One heading\nBody\n- bullet finding")
+
+    assert recs == [BuildRecommendation(id="finding-1", title="bullet finding", description="bullet finding")]
+
+
 def test_selection_requires_missing_dependency_direct():
     recs = [
         BuildRecommendation(id="r2", title="two", description="", depends_on=("r1",)),

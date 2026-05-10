@@ -269,7 +269,7 @@ class ListBuffer:
 
 
 def session_with_mock_stdin(
-    lines: Sequence[str], *, non_interactive: bool = False
+    lines: Sequence[str], *, non_interactive: bool = False, max_retries: int = DEFAULT_MAX_RETRIES
 ) -> tuple[InteractiveSession, ListBuffer, ListBuffer]:
     """Return a session with scripted stdin plus stdout/stderr buffers."""
 
@@ -285,5 +285,11 @@ def session_with_mock_stdin(
     stdin = _Stdin()
     stdout = ListBuffer()
     stderr = ListBuffer()
-    session = InteractiveSession(stdin=stdin, stdout=stdout, stderr=stderr, non_interactive=non_interactive)
+    session = InteractiveSession(
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        non_interactive=non_interactive,
+        max_retries=max_retries,
+    )
     return session, stdout, stderr

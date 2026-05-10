@@ -21,7 +21,7 @@ repos:
     hooks:
       - id: pytest-coverage
         name: pytest coverage
-        entry: uv run --locked pytest --cov=src/llm_plan_execute --cov-report=term-missing --cov-fail-under=80
+        entry: uv run --locked pytest --cov=src/llm_plan_execute --cov-report=term-missing --cov-fail-under=85
         language: system
         pass_filenames: false
       - id: complexipy
