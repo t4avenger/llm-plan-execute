@@ -56,6 +56,7 @@ from .workflow import (
 from .workflow_state import WorkflowState, save_workflow_state
 
 ProgressHook = Callable[..., None]
+_REPORT_MARKDOWN_FILENAME = "report.md"
 
 
 def merge_execution_dirs(workspace: Path, execution: ExecutionConfig, extra_dirs: list[Path]) -> ExecutionConfig:
@@ -112,7 +113,7 @@ def orchestrate_clarification(
             print(f"Run: {run.run_id}")
             print(f"Clarification needed: {run.run_dir / '00-clarification.md'}")
             print("Answer the questions and rerun planning, or use --no-clarify to plan with assumptions.")
-            print(f"Report: {run.run_dir / 'report.md'}")
+            print(f"Report: {run.run_dir / _REPORT_MARKDOWN_FILENAME}")
             return 2
         clarification.answers = [_ask_cli_question(question) for question in clarification.questions]
         clarification.status = "clear"
@@ -335,7 +336,7 @@ def execute_build_through_completion(
         wf.lifecycle_status = "failed"
         save_workflow_state(run.run_dir, wf)
         print(f"Build failed: {run.run_dir / '05-build-output.md'}")
-        print(f"Report: {run.run_dir / 'report.md'}")
+        print(f"Report: {run.run_dir / _REPORT_MARKDOWN_FILENAME}")
         return run, 1
 
     wf.stage = "build_review"
@@ -350,17 +351,17 @@ def execute_build_through_completion(
         wf=wf,
     )
     if review_outcome == "cancel":
-        print(f"Report: {run.run_dir / 'report.md'}")
+        print(f"Report: {run.run_dir / _REPORT_MARKDOWN_FILENAME}")
         return run, 130
 
     completion = finalize_completion_reports(session=session, run=run, wf=wf)
     if completion == "cancel":
-        print(f"Report: {run.run_dir / 'report.md'}")
+        print(f"Report: {run.run_dir / _REPORT_MARKDOWN_FILENAME}")
         return run, 130
 
     print(f"Build output: {run.run_dir / '05-build-output.md'}")
     print(f"Review summary: {run.run_dir / '08-build-review-summary.md'}")
-    print(f"Report: {run.run_dir / 'report.md'}")
+    print(f"Report: {run.run_dir / _REPORT_MARKDOWN_FILENAME}")
     return run, 0
 
 
@@ -373,7 +374,7 @@ def finalize_completion_reports(*, session: InteractiveSession, run: RunState, w
         return "cancel"
     if choice.type == "skip":
         wf.lifecycle_status = "completed"
-        wf.report_markdown_path = "report.md"
+        wf.report_markdown_path = _REPORT_MARKDOWN_FILENAME
         save_workflow_state(run.run_dir, wf)
         return None
 
@@ -391,7 +392,7 @@ def finalize_completion_reports(*, session: InteractiveSession, run: RunState, w
         except OSError as exc:
             print(f"Failed to write HTML report to {html_path}: {exc}")
 
-    wf.report_markdown_path = "report.md"
+    wf.report_markdown_path = _REPORT_MARKDOWN_FILENAME
     wf.lifecycle_status = "completed"
     save_workflow_state(run.run_dir, wf)
     return None
@@ -429,7 +430,7 @@ def _write_apply_follow_up_notes(
     )
     note = "# Follow-up application instructions\n\n" + instructions + "\n"
     write_text(run, "10-build-follow-up.md", note)
-    write_text(run, "report.md", render_report(run))
+    write_text(run, _REPORT_MARKDOWN_FILENAME, render_report(run))
     write_state(run)
 
 

@@ -12,6 +12,7 @@ from .selection_parser import parse_index_selection
 T = TypeVar("T")
 
 DEFAULT_MAX_RETRIES = 5
+_CANCEL_WORKFLOW_LABEL = "Cancel workflow"
 
 
 class InteractiveCanceledError(Exception):
@@ -179,7 +180,7 @@ class InteractiveSession:
             ChoiceOption("1", "Accept plan", PlanReviewDecision(type="accept")),
             ChoiceOption("2", "Modify plan", PlanReviewDecision(type="modify")),
             ChoiceOption("3", "Step through plan", PlanReviewDecision(type="stepThrough")),
-            ChoiceOption("4", "Cancel workflow", PlanReviewDecision(type="cancel")),
+            ChoiceOption("4", _CANCEL_WORKFLOW_LABEL, PlanReviewDecision(type="cancel")),
         )
         return self.prompt_choice("What would you like to do?", options)
 
@@ -187,7 +188,7 @@ class InteractiveSession:
         options = (
             ChoiceOption("1", "Yes, proceed", StageTransitionDecision(type="proceed")),
             ChoiceOption("2", "No, don't proceed", StageTransitionDecision(type="pause")),
-            ChoiceOption("3", "Cancel workflow", StageTransitionDecision(type="cancel")),
+            ChoiceOption("3", _CANCEL_WORKFLOW_LABEL, StageTransitionDecision(type="cancel")),
         )
         return self.prompt_choice("Proceed to the next stage?", options)
 
@@ -204,7 +205,7 @@ class InteractiveSession:
                 "Continue without applying",
                 BuildReviewDecision(type="continueWithoutApplying"),
             ),
-            ChoiceOption("5", "Cancel workflow", BuildReviewDecision(type="cancel")),
+            ChoiceOption("5", _CANCEL_WORKFLOW_LABEL, BuildReviewDecision(type="cancel")),
         )
         return self.prompt_choice("Review found recommended changes. What would you like to do?", options)
 
@@ -217,7 +218,7 @@ class InteractiveSession:
             ChoiceOption("2", "Create HTML report", CompletionReportDecision(type="html")),
             ChoiceOption("3", "Both", CompletionReportDecision(type="both")),
             ChoiceOption("4", "Skip", CompletionReportDecision(type="skip")),
-            ChoiceOption("5", "Cancel workflow", CompletionReportDecision(type="cancel")),
+            ChoiceOption("5", _CANCEL_WORKFLOW_LABEL, CompletionReportDecision(type="cancel")),
         )
         return self.prompt_choice("Workflow complete. How would you like the report?", options)
 

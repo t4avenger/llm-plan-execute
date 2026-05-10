@@ -27,6 +27,7 @@ from .selection import assign_models
 from .types import ROLES, Clarification, ExecutionPolicy, ModelInfo, ProviderResult, RunState, Usage
 
 ProgressCallback = Callable[[str, str, RunState, ModelInfo | None, ProviderResult | None, Path | None], None]
+_PROPOSED_PLAN_ARTIFACT = "04-proposed-plan.md"
 
 
 class BuildFailedError(ValueError):
@@ -151,7 +152,7 @@ def complete_planning(
         run.accepted_plan = arbiter.output
         write_text(run, "04-accepted-plan.md", run.accepted_plan)
     else:
-        write_text(run, "04-proposed-plan.md", arbiter.output)
+        write_text(run, _PROPOSED_PLAN_ARTIFACT, arbiter.output)
 
     write_state(run)
     report = render_report(run)
@@ -168,7 +169,7 @@ def revise_proposed_plan(
     progress: ProgressCallback | None = None,
     feedback_history: list[str],
 ) -> RunState:
-    proposed_path = run.run_dir / "04-proposed-plan.md"
+    proposed_path = run.run_dir / _PROPOSED_PLAN_ARTIFACT
     prior = proposed_path.read_text(encoding="utf-8") if proposed_path.exists() else ""
     history = list(feedback_history)
     planner_prompt_override = plan_revision_prompt(run.prompt, prior, history)
@@ -265,7 +266,7 @@ def record_build_recommendation_application(
 def accept_plan(existing: RunState) -> RunState:
     if existing.build_output:
         raise ValueError("Run already has build output and cannot accept a different plan.")
-    proposed_path = existing.run_dir / "04-proposed-plan.md"
+    proposed_path = existing.run_dir / _PROPOSED_PLAN_ARTIFACT
     if not proposed_path.exists():
         raise ValueError("Run has no proposed plan to accept.")
 

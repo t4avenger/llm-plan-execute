@@ -544,9 +544,7 @@ def _cmd_build(
     wf.stage = "pre_build"
     save_workflow_state(run.run_dir, wf)
 
-    if session.non_interactive:
-        transition = "proceed"
-    else:
+    if not session.non_interactive:
         transition = gate_stage_transition(session=session, wf=wf, run=run)
         if transition == "pause":
             state_path = save_workflow_state(run.run_dir, wf)

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -131,19 +130,27 @@ def _parse_embedded_json(markdown: str) -> list[BuildRecommendation]:
     return recommendations
 
 
-_HEADING_PATTERN = re.compile(r"^###\s+(.+)$", re.MULTILINE)
-
-
 def _parse_heading_blocks(markdown: str) -> list[BuildRecommendation]:
-    matches = list(_HEADING_PATTERN.finditer(markdown))
-    if len(matches) < _MIN_HEADING_BLOCKS:
+    blocks: list[tuple[str, list[str]]] = []
+    current_title: str | None = None
+    current_body: list[str] = []
+    for line in markdown.splitlines():
+        if line.startswith("### ") and line.removeprefix("### ").strip():
+            if current_title is not None:
+                blocks.append((current_title, current_body))
+            current_title = line.removeprefix("### ").strip()
+            current_body = []
+            continue
+        if current_title is not None:
+            current_body.append(line)
+    if current_title is not None:
+        blocks.append((current_title, current_body))
+
+    if len(blocks) < _MIN_HEADING_BLOCKS:
         return []
     recommendations: list[BuildRecommendation] = []
-    for index, match in enumerate(matches):
-        title = match.group(1).strip()
-        start = match.end()
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(markdown)
-        body = markdown[start:end].strip()
+    for index, (title, body_lines) in enumerate(blocks):
+        body = "\n".join(body_lines).strip()
         rec_id = f"heading-{index + 1}"
         recommendations.append(BuildRecommendation(id=rec_id, title=title, description=body))
     return recommendations
