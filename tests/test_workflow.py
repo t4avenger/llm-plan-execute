@@ -139,7 +139,7 @@ def test_noop_code_build_fails_and_skips_reviewers(tmp_path, monkeypatch):
     provider = RecordingBuildProvider()
     router = ProviderRouter([provider], workspace=tmp_path)
     run = _accepted_build_run(tmp_path)
-    monkeypatch.setattr("llm_plan_execute.workflow._workspace_changes", lambda _workspace: "unchanged-diff")
+    monkeypatch.setattr("llm_plan_execute.workflow._workspace_changes", lambda *_a, **_kw: "unchanged-diff")
 
     with pytest.raises(BuildFailedError, match="without changing the workspace"):
         run_build(run, router)
@@ -154,7 +154,7 @@ def test_dirty_workspace_with_changed_diff_does_not_fail_as_noop(tmp_path, monke
     router = ProviderRouter([provider], workspace=tmp_path)
     run = _accepted_build_run(tmp_path)
     snapshots = iter(["dirty-before", "dirty-after"])
-    monkeypatch.setattr("llm_plan_execute.workflow._workspace_changes", lambda _workspace: next(snapshots))
+    monkeypatch.setattr("llm_plan_execute.workflow._workspace_changes", lambda *_a, **_kw: next(snapshots))
 
     run_build(run, router)
 
@@ -167,7 +167,7 @@ def test_workflow_records_phase_execution_policies(tmp_path, monkeypatch):
     router = ProviderRouter([provider], workspace=tmp_path)
     run = _accepted_build_run(tmp_path)
     snapshots = iter(["dirty-before", "dirty-after"])
-    monkeypatch.setattr("llm_plan_execute.workflow._workspace_changes", lambda _workspace: next(snapshots))
+    monkeypatch.setattr("llm_plan_execute.workflow._workspace_changes", lambda *_a, **_kw: next(snapshots))
 
     run_build(run, router, execution=ExecutionConfig())
 
@@ -182,7 +182,7 @@ def test_permission_override_applies_to_provider_calls(tmp_path, monkeypatch):
     router = ProviderRouter([provider], workspace=tmp_path)
     run = _accepted_build_run(tmp_path)
     snapshots = iter(["dirty-before", "dirty-after"])
-    monkeypatch.setattr("llm_plan_execute.workflow._workspace_changes", lambda _workspace: next(snapshots))
+    monkeypatch.setattr("llm_plan_execute.workflow._workspace_changes", lambda *_a, **_kw: next(snapshots))
 
     run_build(run, router, execution=ExecutionConfig(), permission_mode="full-access")
 

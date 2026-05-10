@@ -1,0 +1,73 @@
+name: Package
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  install-smoke:
+    name: Install (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - name: Smoke-test wheel install (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          python -m venv .venv-wheel
+          .venv-wheel/bin/python -m pip install --upgrade pip
+          .venv-wheel/bin/python -m pip install dist/*.whl
+          .venv-wheel/bin/llm-plan-execute --help | head -20
+      - name: Smoke-test sdist install (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          python -m venv .venv-sdist
+          .venv-sdist/bin/python -m pip install --upgrade pip
+          .venv-sdist/bin/python -m pip install dist/*.tar.gz
+          .venv-sdist/bin/llm-plan-execute --help | head -20
+      - name: Smoke-test wheel install (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m venv .venv-wheel
+          .venv-wheel\Scripts\python -m pip install --upgrade pip
+          $whl = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          .venv-wheel\Scripts\python -m pip install $whl
+          .venv-wheel\Scripts\llm-plan-execute.exe --help | Select-Object -First 20
+      - name: Smoke-test sdist install (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m venv .venv-sdist
+          .venv-sdist\Scripts\python -m pip install --upgrade pip
+          $sdist = (Get-ChildItem dist\*.tar.gz | Select-Object -First 1).FullName
+          .venv-sdist\Scripts\python -m pip install $sdist
+          .venv-sdist\Scripts\llm-plan-execute.exe --help | Select-Object -First 20
+      - name: CLI with spaced repo path (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $r = Join-Path $env:TEMP "lpe workspace test"
+          New-Item -ItemType Directory -Force -Path $r | Out-Null
+          python -m venv .venv-win-test
+          $whl = (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          .venv-win-test\Scripts\python -m pip install --upgrade pip
+          .venv-win-test\Scripts\python -m pip install $whl
+          .venv-win-test\Scripts\llm-plan-execute.exe --repo $r --dry-run models | Select-Object -First 5
