@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -19,7 +20,7 @@ from .prompts import (
 from .providers import ProviderRouter
 from .reporting import render_report
 from .selection import assign_models
-from .types import ROLES, Clarification, ModelInfo, ProviderResult, RunState
+from .types import ROLES, Clarification, ModelInfo, ProviderResult, RunState, Usage
 
 ProgressCallback = Callable[[str, str, RunState, ModelInfo | None, ProviderResult | None, Path | None], None]
 
@@ -228,19 +229,40 @@ def _run_provider(
 ) -> ProviderResult:
     if progress:
         progress("start", role, run, model, None, None)
-    result = router.run(role, model, prompt)
-    if progress:
-        progress("finish", role, run, model, result, None)
-    return result
+    try:
+        result = router.run(role, model, prompt)
+    except Exception as exc:
+        if progress:
+            progress("finish", role, run, model, _failed_provider_result(role, model, prompt, exc), None)
+        raise
+    else:
+        if progress:
+            progress("finish", role, run, model, result, None)
+        return result
 
 
-def _workspace_changes(workspace: Path) -> frozenset[str] | None:
+def _failed_provider_result(role: str, model: ModelInfo, prompt: str, exc: Exception) -> ProviderResult:
+    error = str(exc)
+    return ProviderResult(role, model, prompt, error, Usage(), 0.0, error)
+
+
+def _workspace_changes(workspace: Path) -> str | None:
     git = shutil.which("git")
     if git is None:
         return None
+    status = _git_output(git, workspace, ["status", "--porcelain=v1", "-z"])
+    staged_diff = _git_output(git, workspace, ["diff", "--cached", "--binary", "HEAD", "--"])
+    unstaged_diff = _git_output(git, workspace, ["diff", "--binary", "--"])
+    untracked = _git_output(git, workspace, ["ls-files", "--others", "--exclude-standard", "-z"])
+    if status is None or staged_diff is None or unstaged_diff is None or untracked is None:
+        return None
+    return "\0".join((status, staged_diff, unstaged_diff, _untracked_file_hashes(workspace, untracked)))
+
+
+def _git_output(git: str, workspace: Path, args: list[str]) -> str | None:
     try:
         completed = subprocess.run(  # noqa: S603 - fixed git executable with static arguments.
-            [git, "status", "--short"],
+            [git, *args],
             cwd=workspace,
             text=True,
             capture_output=True,
@@ -250,14 +272,28 @@ def _workspace_changes(workspace: Path) -> frozenset[str] | None:
         return None
     if completed.returncode != 0:
         return None
-    return frozenset(line for line in completed.stdout.splitlines() if line.strip())
+    return completed.stdout
+
+
+def _untracked_file_hashes(workspace: Path, output: str) -> str:
+    entries: list[str] = []
+    for name in output.split("\0"):
+        if not name:
+            continue
+        path = workspace / name
+        if not path.is_file():
+            entries.append(f"{name}:<not-file>")
+            continue
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        entries.append(f"{name}:{digest}")
+    return "\0".join(entries)
 
 
 def _build_failure(
     run: RunState,
     build: ProviderResult,
-    before_changes: frozenset[str] | None,
-    after_changes: frozenset[str] | None,
+    before_changes: str | None,
+    after_changes: str | None,
     dry_run: bool,
 ) -> str | None:
     if build.error:

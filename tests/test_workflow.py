@@ -4,6 +4,7 @@ from llm_plan_execute.providers import DryRunProvider, Provider, ProviderRouter
 from llm_plan_execute.types import ModelAssignment, ModelInfo, ProviderResult, RunState, Usage
 from llm_plan_execute.workflow import (
     BuildFailedError,
+    _run_provider,
     accept_plan,
     complete_planning,
     run_build,
@@ -137,7 +138,7 @@ def test_noop_code_build_fails_and_skips_reviewers(tmp_path, monkeypatch):
     provider = RecordingBuildProvider()
     router = ProviderRouter([provider], workspace=tmp_path)
     run = _accepted_build_run(tmp_path)
-    monkeypatch.setattr("llm_plan_execute.workflow._workspace_changes", lambda _workspace: frozenset({" M file.py"}))
+    monkeypatch.setattr("llm_plan_execute.workflow._workspace_changes", lambda _workspace: "unchanged-diff")
 
     with pytest.raises(BuildFailedError, match="without changing the workspace"):
         run_build(run, router)
@@ -145,6 +146,35 @@ def test_noop_code_build_fails_and_skips_reviewers(tmp_path, monkeypatch):
     assert provider.calls == ["builder"]
     assert run.build_status == "failed"
     assert not (run.run_dir / "08-build-review-summary.md").exists()
+
+
+def test_dirty_workspace_with_changed_diff_does_not_fail_as_noop(tmp_path, monkeypatch):
+    provider = RecordingBuildProvider()
+    router = ProviderRouter([provider], workspace=tmp_path)
+    run = _accepted_build_run(tmp_path)
+    snapshots = iter(["dirty-before", "dirty-after"])
+    monkeypatch.setattr("llm_plan_execute.workflow._workspace_changes", lambda _workspace: next(snapshots))
+
+    run_build(run, router)
+
+    assert provider.calls == ["builder", "build_reviewer_a", "build_reviewer_b", "build_arbiter"]
+    assert run.build_status == "succeeded"
+
+
+def test_run_provider_emits_finish_progress_when_router_raises(tmp_path):
+    run = RunState.create("prompt", tmp_path)
+    model = ModelInfo("missing", "model")
+    events = []
+
+    def record(*event):
+        events.append(event)
+
+    with pytest.raises(ValueError, match="No provider can run"):
+        _run_provider(run, ProviderRouter([]), "builder", model, "prompt", record)
+
+    assert [event[0] for event in events] == ["start", "finish"]
+    assert events[1][4] is not None
+    assert events[1][4].error is not None
 
 
 def _accepted_build_run(tmp_path):
