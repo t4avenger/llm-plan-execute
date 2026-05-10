@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .types import ProviderResult, RunState, assignment_to_dict, model_to_dict, usage_to_dict
+from .types import ProviderResult, RunState, assignment_to_dict, clarification_to_dict, model_to_dict, usage_to_dict
 
 
 def ensure_run_dir(run: RunState) -> None:
@@ -51,6 +51,7 @@ def write_state(run: RunState) -> Path:
             "results": [result_to_dict(result) for result in run.results],
             "warnings": run.warnings,
             "next_options": run.next_options,
+            "clarification": clarification_to_dict(run.clarification) if run.clarification else None,
         },
     )
 

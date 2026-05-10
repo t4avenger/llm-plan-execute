@@ -27,6 +27,13 @@ def render_report(run: RunState) -> str:
         lines.extend(["", "## Warnings"])
         lines.extend(f"- {warning}" for warning in run.warnings)
 
+    if run.clarification:
+        lines.extend(["", "## Clarification", f"- Status: {run.clarification.status}"])
+        if run.clarification.questions:
+            lines.append(f"- Questions: {len(run.clarification.questions)}")
+        if run.clarification.answers:
+            lines.append(f"- Answers: {len(run.clarification.answers)}")
+
     lines.extend(["", "## Usage"])
     for result in run.results:
         exact = "exact" if result.usage.exact else result.usage.confidence

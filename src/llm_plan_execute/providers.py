@@ -212,6 +212,8 @@ def _process_error(returncode: int, stderr: str | None) -> str | None:
 
 
 def dry_response(role: str, prompt: str) -> str:
+    if role == "clarifier":
+        return _dry_clarifier_response(prompt)
     if role == "planner":
         return (
             "# Draft Plan\n\n"
@@ -241,3 +243,21 @@ def dry_response(role: str, prompt: str) -> str:
             "Run artifacts and report outputs were generated for review.\n"
         )
     return f"# {role}\n\nProcessed prompt of {len(prompt)} characters."
+
+
+def _dry_clarifier_response(prompt: str) -> str:
+    if "ambiguous" in prompt.lower():
+        return (
+            "STATUS: needs_questions\n"
+            "QUESTIONS:\n"
+            "- What behavior should the change implement?\n"
+            "ASSUMPTIONS:\n"
+            "- The implementation should stay scoped to the current repository.\n"
+        )
+    return (
+        "STATUS: clear\n"
+        "QUESTIONS:\n"
+        "- none\n"
+        "ASSUMPTIONS:\n"
+        "- Use the existing project patterns and verification commands.\n"
+    )
