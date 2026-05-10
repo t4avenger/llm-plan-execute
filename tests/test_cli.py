@@ -150,6 +150,28 @@ def test_config_validate_reports_missing_enabled_command(tmp_path, capsys, monke
     assert "was not found on PATH" in captured.err
 
 
+def test_config_validate_reports_invalid_execution_mode(tmp_path, capsys):
+    config = tmp_path / "config.json"
+    config.write_text(
+        """
+{
+  "dry_run": true,
+  "execution": {
+    "default_mode": "root"
+  },
+  "providers": []
+}
+""",
+        encoding="utf-8",
+    )
+
+    exit_code = main(["--config", str(config), "config", "validate"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "execution.default_mode" in captured.err
+
+
 def test_config_validate_skips_missing_commands_in_dry_run(tmp_path, capsys, monkeypatch):
     config = tmp_path / "config.json"
     config.write_text(
@@ -345,6 +367,21 @@ def test_run_approve_builds_after_inline_plan_review(tmp_path, capsys, monkeypat
     run_line = next(line for line in captured.out.splitlines() if line.startswith("Run:"))
     run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
     assert (run_dir / "08-build-review-summary.md").exists()
+
+
+def test_build_permission_mode_is_recorded(tmp_path, capsys):
+    config = _write_dry_config(tmp_path)
+    main(["--config", str(config), "plan", "--prompt", "Add a small feature", "--no-clarify", "--yes"])
+    captured = capsys.readouterr()
+    run_line = next(line for line in captured.out.splitlines() if line.startswith("Run:"))
+    run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
+
+    exit_code = main(["--config", str(config), "build", "--run-dir", str(run_dir), "--permission-mode", "full-access"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    policies = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["execution_policies"]
+    assert policies["builder"]["mode"] == "full-access"
 
 
 def test_run_cancel_stops_before_build(tmp_path, capsys, monkeypatch):

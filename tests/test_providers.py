@@ -3,7 +3,7 @@ from pathlib import Path
 
 from llm_plan_execute.config import ProviderConfig
 from llm_plan_execute.providers import ClaudeAdapter, CLIProvider, CodexAdapter, CursorAdapter, Provider, ProviderRouter
-from llm_plan_execute.types import ModelInfo, ProviderResult, Usage
+from llm_plan_execute.types import ExecutionPolicy, ModelInfo, ProviderResult, Usage
 
 
 def test_cli_provider_captures_nonzero_exit_code(monkeypatch):
@@ -43,13 +43,15 @@ def test_codex_adapter_builds_noninteractive_command():
     config = ProviderConfig("codex", "codex", True, (model,))
     workspace = Path(".")
 
-    command = CodexAdapter().build_command(config, model, "write tests", workspace)
+    command = CodexAdapter().build_command(config, model, "write tests", workspace, ExecutionPolicy())
 
     assert command.args == [
         "codex",
         "exec",
         "--model",
         "gpt-5.4",
+        "--sandbox",
+        "workspace-write",
         "--cd",
         str(workspace.resolve()),
         "write tests",
@@ -57,12 +59,40 @@ def test_codex_adapter_builds_noninteractive_command():
     assert command.cwd == workspace.resolve()
 
 
+def test_codex_adapter_builds_full_access_command():
+    model = ModelInfo("codex", "gpt-5.4")
+    config = ProviderConfig("codex", "codex", True, (model,))
+    workspace = Path(".")
+
+    command = CodexAdapter().build_command(config, model, "write tests", workspace, ExecutionPolicy("full-access"))
+
+    assert "--dangerously-bypass-approvals-and-sandbox" in command.args
+    assert "--sandbox" not in command.args
+
+
+def test_codex_adapter_adds_writable_dirs():
+    model = ModelInfo("codex", "gpt-5.4")
+    config = ProviderConfig("codex", "codex", True, (model,))
+    workspace = Path(".")
+    extra_dir = Path("tmp-extra")
+
+    command = CodexAdapter().build_command(
+        config,
+        model,
+        "write tests",
+        workspace,
+        ExecutionPolicy("workspace-write", (extra_dir,)),
+    )
+
+    assert command.args[command.args.index("--add-dir") + 1] == str(extra_dir.resolve())
+
+
 def test_cursor_adapter_builds_headless_command():
     model = ModelInfo("cursor", "auto")
     config = ProviderConfig("cursor", "cursor-agent", True, (model,))
     workspace = Path(".")
 
-    command = CursorAdapter().build_command(config, model, "build feature", workspace)
+    command = CursorAdapter().build_command(config, model, "build feature", workspace, ExecutionPolicy())
 
     assert command.args == [
         "cursor-agent",
@@ -79,12 +109,37 @@ def test_cursor_adapter_builds_headless_command():
     assert command.cwd == workspace.resolve()
 
 
+def test_cursor_adapter_builds_full_access_command():
+    model = ModelInfo("cursor", "auto")
+    config = ProviderConfig("cursor", "cursor-agent", True, (model,))
+    workspace = Path(".")
+
+    command = CursorAdapter().build_command(config, model, "build feature", workspace, ExecutionPolicy("full-access"))
+
+    assert "--force" in command.args
+    assert "--sandbox" in command.args
+    assert "disabled" in command.args
+
+
+def test_cursor_adapter_builds_read_only_command():
+    model = ModelInfo("cursor", "auto")
+    config = ProviderConfig("cursor", "cursor-agent", True, (model,))
+    workspace = Path(".")
+
+    command = CursorAdapter().build_command(config, model, "review plan", workspace, ExecutionPolicy("read-only"))
+
+    assert "--mode" in command.args
+    assert "plan" in command.args
+    assert "--sandbox" in command.args
+    assert "enabled" in command.args
+
+
 def test_claude_adapter_builds_documented_extension_command():
     model = ModelInfo("claude", "sonnet")
     config = ProviderConfig("claude", "claude", True, (model,))
     workspace = Path(".")
 
-    command = ClaudeAdapter().build_command(config, model, "review plan", workspace)
+    command = ClaudeAdapter().build_command(config, model, "review plan", workspace, ExecutionPolicy())
 
     assert command.args == ["claude", "--model", "sonnet", "review plan"]
     assert command.cwd == workspace.resolve()
@@ -124,6 +179,12 @@ class RecordingProvider(Provider):
     def available_models(self) -> list[ModelInfo]:
         return [self.model]
 
-    def run(self, role: str, model: ModelInfo, prompt: str) -> ProviderResult:
+    def run(
+        self,
+        role: str,
+        model: ModelInfo,
+        prompt: str,
+        _execution_policy: ExecutionPolicy | None = None,
+    ) -> ProviderResult:
         self.calls.append(role)
         return ProviderResult(role, model, prompt, "ok", Usage(), 0.0)
