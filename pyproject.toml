@@ -19,6 +19,7 @@ llm-plan-execute = "llm_plan_execute.cli:main"
 dev = [
     "pre-commit>=4.2.0",
     "pytest>=8.3.5",
+    "pytest-cov>=7.1.0",
     "ruff>=0.11.10",
 ]
 

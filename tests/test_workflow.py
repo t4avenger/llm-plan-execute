@@ -1,7 +1,8 @@
 import pytest
 
+from llm_plan_execute.config import ExecutionConfig
 from llm_plan_execute.providers import DryRunProvider, Provider, ProviderRouter
-from llm_plan_execute.types import ModelAssignment, ModelInfo, ProviderResult, RunState, Usage
+from llm_plan_execute.types import ExecutionPolicy, ModelAssignment, ModelInfo, ProviderResult, RunState, Usage
 from llm_plan_execute.workflow import (
     BuildFailedError,
     _run_provider,
@@ -161,6 +162,34 @@ def test_dirty_workspace_with_changed_diff_does_not_fail_as_noop(tmp_path, monke
     assert run.build_status == "succeeded"
 
 
+def test_workflow_records_phase_execution_policies(tmp_path, monkeypatch):
+    provider = RecordingBuildProvider()
+    router = ProviderRouter([provider], workspace=tmp_path)
+    run = _accepted_build_run(tmp_path)
+    snapshots = iter(["dirty-before", "dirty-after"])
+    monkeypatch.setattr("llm_plan_execute.workflow._workspace_changes", lambda _workspace: next(snapshots))
+
+    run_build(run, router, execution=ExecutionConfig())
+
+    assert provider.policies["builder"].mode == "workspace-write"
+    assert provider.policies["build_reviewer_a"].mode == "read-only"
+    assert run.execution_policies["builder"].mode == "workspace-write"
+    assert run.execution_policies["build_arbiter"].mode == "read-only"
+
+
+def test_permission_override_applies_to_provider_calls(tmp_path, monkeypatch):
+    provider = RecordingBuildProvider()
+    router = ProviderRouter([provider], workspace=tmp_path)
+    run = _accepted_build_run(tmp_path)
+    snapshots = iter(["dirty-before", "dirty-after"])
+    monkeypatch.setattr("llm_plan_execute.workflow._workspace_changes", lambda _workspace: next(snapshots))
+
+    run_build(run, router, execution=ExecutionConfig(), permission_mode="full-access")
+
+    assert provider.policies["builder"].mode == "full-access"
+    assert provider.policies["build_reviewer_a"].mode == "full-access"
+
+
 def test_run_provider_emits_finish_progress_when_router_raises(tmp_path):
     run = RunState.create("prompt", tmp_path)
     model = ModelInfo("missing", "model")
@@ -170,7 +199,7 @@ def test_run_provider_emits_finish_progress_when_router_raises(tmp_path):
         events.append(event)
 
     with pytest.raises(ValueError, match="No provider can run"):
-        _run_provider(run, ProviderRouter([]), "builder", model, "prompt", record)
+        _run_provider(run, ProviderRouter([]), "builder", model, "prompt", ExecutionPolicy(), record)
 
     assert [event[0] for event in events] == ["start", "finish"]
     assert events[1][4] is not None
@@ -194,6 +223,7 @@ class RecordingBuildProvider(Provider):
     def __init__(self, *, builder_error: str | None = None) -> None:
         self.builder_error = builder_error
         self.calls: list[str] = []
+        self.policies: dict[str, ExecutionPolicy] = {}
 
     def available_models(self) -> list[ModelInfo]:
         return [
@@ -203,8 +233,16 @@ class RecordingBuildProvider(Provider):
             ModelInfo("local", "build_arbiter", ("build_arbiter",)),
         ]
 
-    def run(self, role: str, model: ModelInfo, prompt: str) -> ProviderResult:
+    def run(
+        self,
+        role: str,
+        model: ModelInfo,
+        prompt: str,
+        execution_policy: ExecutionPolicy | None = None,
+    ) -> ProviderResult:
         self.calls.append(role)
+        if execution_policy:
+            self.policies[role] = execution_policy
         error = self.builder_error if role == "builder" else None
         output = error or f"{role} output"
         return ProviderResult(role, model, prompt, output, Usage(), 0.0, error)

@@ -47,6 +47,15 @@ The real-provider path uses explicit adapters for each supported CLI:
   "dry_run": false,
   "workspace": ".",
   "runs_dir": ".llm-plan-execute/runs",
+  "execution": {
+    "default_mode": "workspace-write",
+    "phases": {
+      "planning": "read-only",
+      "review": "read-only",
+      "build": "workspace-write"
+    },
+    "writable_dirs": []
+  },
   "providers": [
     {
       "name": "codex",
@@ -90,7 +99,9 @@ The real-provider path uses explicit adapters for each supported CLI:
 }
 ```
 
-Codex is invoked as `codex exec --model <model> --cd <workspace> <prompt>`. Cursor Agent is invoked as `cursor-agent --print --output-format text --model <model> --workspace <workspace> --trust <prompt>`. Claude remains a documented extension point, but it should stay disabled unless the `claude` command is installed and an adapter has been validated for the local CLI version.
+Execution permissions are passed to provider CLIs for every model call. By default, planning and review calls use `read-only`, while the builder uses `workspace-write`. Override a command with `--permission-mode read-only|workspace-write|full-access`, and add extra writable locations with repeated `--writable-dir <path>`.
+
+Codex is invoked as `codex exec --model <model> --sandbox <mode> --cd <workspace> <prompt>` for normal modes, with `full-access` mapped to `--dangerously-bypass-approvals-and-sandbox`. Cursor Agent is invoked as `cursor-agent --print --output-format text --model <model> --workspace <workspace> --trust <prompt>`; `read-only` adds `--mode plan --sandbox enabled`, and `full-access` adds `--force --sandbox disabled`. Claude remains a documented extension point, but it should stay disabled unless the `claude` command is installed and an adapter has been validated for the local CLI version.
 
 Common failure modes:
 
@@ -100,6 +111,7 @@ Common failure modes:
 - `config validate` reports a missing command: install the provider CLI or set that provider to `"enabled": false`.
 - `models` reports no available models: use `--dry-run`, enable at least one installed provider, or add models with roles that match the workflow.
 - Provider output is empty with stderr: inspect the run report and the provider's authentication or workspace trust status.
+- Agents cannot read files, edit files, or run needed commands: use `--permission-mode workspace-write` for repo-local work, or explicitly choose `full-access` only when you want the provider CLI to bypass its normal approval or sandbox boundary.
 
 ## Workflow
 
@@ -118,6 +130,8 @@ uv run llm-plan-execute accept --run-dir .llm-plan-execute/runs/<run-id>
 ```
 
 Build then uses a speed/accuracy oriented model and repeats review with two separate reviewers plus a summarizing arbiter. The `run` command prompts you to approve, cancel, or save the reviewed plan before build. Use separate `plan`, `accept`, `build`, and `report` commands for scripting or advanced control. Use `plan --yes` only for deliberate non-interactive automation that should accept the reviewed plan immediately.
+
+When `run` is interactive, the approval prompt also accepts a permission mode. Enter `approve` to build with the configured default, or enter `read-only`, `workspace-write`, or `full-access` to approve and run the build with that mode.
 
 Progress is written to stderr so stdout stays usable for command output. Pass `--quiet` to suppress progress, or `--verbose` to include provider error details. The final report includes model assignments, fallback warnings, build status, token usage, estimated cost, and prompt improvement advice.
 
@@ -157,7 +171,6 @@ Known follow-ups:
 - Add exact usage parsing per provider when CLIs expose structured usage.
 - Add structured JSON output mode for provider calls where available.
 - Add release workflow and versioning policy.
-- Add coverage reporting and publish coverage into Sonar.
 - Add Dependabot or Renovate for pinned actions and Python tooling.
 - Add a security policy, contribution guide, and changelog once external contributors are expected.
 - Add real integration tests gated behind opt-in environment variables for authenticated provider CLIs.

@@ -42,6 +42,9 @@ def _summary_lines(
         lines.append(f"- Build status: {run.build_status}")
     if run.build_failure:
         lines.append(f"- Build failure: {run.build_failure}")
+    if run.execution_policies:
+        modes = sorted({policy.mode for policy in run.execution_policies.values()})
+        lines.append(f"- Execution permissions: {', '.join(modes)}")
     lines.extend(["", "## Model Assignments"])
     return lines
 

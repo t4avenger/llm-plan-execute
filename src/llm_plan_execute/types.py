@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+PERMISSION_MODES = ("read-only", "workspace-write", "full-access")
 ROLES = (
     "planner",
     "plan_reviewer_a",
@@ -66,6 +67,12 @@ class ProviderResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class ExecutionPolicy:
+    mode: str = "workspace-write"
+    writable_dirs: tuple[Path, ...] = ()
+
+
 @dataclass
 class Clarification:
     status: str = "skipped"
@@ -90,6 +97,7 @@ class RunState:
     warnings: list[str] = field(default_factory=list)
     next_options: list[str] = field(default_factory=list)
     clarification: Clarification | None = None
+    execution_policies: dict[str, ExecutionPolicy] = field(default_factory=dict)
 
     @classmethod
     def create(cls, prompt: str, runs_root: Path) -> RunState:
@@ -138,4 +146,11 @@ def clarification_to_dict(clarification: Clarification) -> dict[str, Any]:
         "assumptions": clarification.assumptions,
         "answers": clarification.answers,
         "raw_output": clarification.raw_output,
+    }
+
+
+def execution_policy_to_dict(policy: ExecutionPolicy) -> dict[str, Any]:
+    return {
+        "mode": policy.mode,
+        "writable_dirs": [str(path) for path in policy.writable_dirs],
     }

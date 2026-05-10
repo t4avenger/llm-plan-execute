@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .types import ROLES, ModelInfo
+from .types import PERMISSION_MODES, ROLES, ExecutionPolicy, ModelInfo
 
 DEFAULT_ROOT = Path(".llm-plan-execute")
 DEFAULT_CONFIG = DEFAULT_ROOT / "config.json"
@@ -25,11 +25,34 @@ class ProviderConfig:
 
 
 @dataclass(frozen=True)
+class ExecutionConfig:
+    default_mode: str = "workspace-write"
+    planning_mode: str = "read-only"
+    review_mode: str = "read-only"
+    build_mode: str = "workspace-write"
+    writable_dirs: tuple[Path, ...] = ()
+
+    def policy_for_role(self, role: str, *, mode_override: str | None = None) -> ExecutionPolicy:
+        mode = mode_override or self.mode_for_role(role)
+        return ExecutionPolicy(mode, self.writable_dirs)
+
+    def mode_for_role(self, role: str) -> str:
+        if role == "builder":
+            return self.build_mode
+        if "reviewer" in role or role.endswith("arbiter"):
+            return self.review_mode
+        if role in {"planner", "clarifier"}:
+            return self.planning_mode
+        return self.default_mode
+
+
+@dataclass(frozen=True)
 class AppConfig:
     providers: tuple[ProviderConfig, ...]
     runs_dir: Path = DEFAULT_ROOT / "runs"
     dry_run: bool = False
     workspace: Path = Path(".")
+    execution: ExecutionConfig = field(default_factory=ExecutionConfig)
 
 
 @dataclass(frozen=True)
@@ -57,6 +80,15 @@ def sample_config() -> dict[str, Any]:
         "dry_run": False,
         "runs_dir": ".llm-plan-execute/runs",
         "workspace": ".",
+        "execution": {
+            "default_mode": "workspace-write",
+            "phases": {
+                "planning": "read-only",
+                "review": "read-only",
+                "build": "workspace-write",
+            },
+            "writable_dirs": [],
+        },
         "providers": [
             {
                 "name": "codex",
@@ -184,6 +216,26 @@ def parse_config(raw: dict[str, Any], *, dry_run: bool = False) -> AppConfig:
         runs_dir=Path(raw.get("runs_dir", ".llm-plan-execute/runs")),
         dry_run=bool(raw.get("dry_run", False) or dry_run),
         workspace=Path(raw.get("workspace", ".")),
+        execution=_parse_execution(raw.get("execution", {})),
+    )
+
+
+def _parse_execution(raw: object) -> ExecutionConfig:
+    if not isinstance(raw, dict):
+        return ExecutionConfig()
+    phases = raw.get("phases", {})
+    if not isinstance(phases, dict):
+        phases = {}
+    writable_dirs = raw.get("writable_dirs", [])
+    if not isinstance(writable_dirs, list):
+        writable_dirs = []
+    default_mode = str(raw.get("default_mode", "workspace-write"))
+    return ExecutionConfig(
+        default_mode=default_mode,
+        planning_mode=str(phases.get("planning", "read-only")),
+        review_mode=str(phases.get("review", "read-only")),
+        build_mode=str(phases.get("build", default_mode)),
+        writable_dirs=tuple(Path(path) for path in writable_dirs if isinstance(path, str)),
     )
 
 
@@ -225,6 +277,7 @@ def validate_config_data(raw: object, *, require_providers: bool | None = None) 
         require_providers = not bool(raw.get("dry_run", False))
 
     _validate_root_fields(raw, errors)
+    _validate_execution(raw.get("execution", {}), errors)
 
     providers = raw.get("providers")
     if providers is None and not require_providers:
@@ -248,6 +301,40 @@ def _validate_root_fields(raw: dict[str, Any], errors: list[ConfigIssue]) -> Non
         errors.append(ConfigIssue("error", "runs_dir", "must be a string path"))
     if "workspace" in raw and not isinstance(raw["workspace"], str):
         errors.append(ConfigIssue("error", "workspace", "must be a string path"))
+
+
+def _validate_execution(raw: object, errors: list[ConfigIssue]) -> None:
+    if raw in ({}, None):
+        return
+    if not isinstance(raw, dict):
+        errors.append(ConfigIssue("error", "execution", "must be an object"))
+        return
+    _validate_permission_mode("execution.default_mode", raw.get("default_mode", "workspace-write"), errors)
+    _validate_execution_phases(raw.get("phases", {}), errors)
+    _validate_writable_dirs(raw.get("writable_dirs", []), errors)
+
+
+def _validate_execution_phases(phases: object, errors: list[ConfigIssue]) -> None:
+    if not isinstance(phases, dict):
+        errors.append(ConfigIssue("error", "execution.phases", "must be an object"))
+        return
+    for phase in ("planning", "review", "build"):
+        if phase in phases:
+            _validate_permission_mode(f"execution.phases.{phase}", phases[phase], errors)
+
+
+def _validate_writable_dirs(writable_dirs: object, errors: list[ConfigIssue]) -> None:
+    if not isinstance(writable_dirs, list):
+        errors.append(ConfigIssue("error", "execution.writable_dirs", "must be a list of string paths"))
+        return
+    for index, item in enumerate(writable_dirs):
+        if not isinstance(item, str) or not item:
+            errors.append(ConfigIssue("error", f"execution.writable_dirs[{index}]", "must be a non-empty string path"))
+
+
+def _validate_permission_mode(path: str, value: object, errors: list[ConfigIssue]) -> None:
+    if value not in PERMISSION_MODES:
+        errors.append(ConfigIssue("error", path, f"must be one of {list(PERMISSION_MODES)}"))
 
 
 def _validate_provider(

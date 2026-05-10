@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import AppConfig, ProviderConfig
-from .types import ModelInfo, ProviderResult, Usage
+from .types import ExecutionPolicy, ModelInfo, ProviderResult, Usage
 
 
 def estimate_tokens(text: str) -> int:
@@ -24,7 +24,13 @@ class Provider:
     def available_models(self) -> list[ModelInfo]:
         raise NotImplementedError
 
-    def run(self, role: str, model: ModelInfo, prompt: str) -> ProviderResult:
+    def run(
+        self,
+        role: str,
+        model: ModelInfo,
+        prompt: str,
+        _execution_policy: ExecutionPolicy | None = None,
+    ) -> ProviderResult:
         raise NotImplementedError
 
 
@@ -48,7 +54,13 @@ class DryRunProvider(Provider):
     def available_models(self) -> list[ModelInfo]:
         return list(self.models)
 
-    def run(self, role: str, model: ModelInfo, prompt: str) -> ProviderResult:
+    def run(
+        self,
+        role: str,
+        model: ModelInfo,
+        prompt: str,
+        _execution_policy: ExecutionPolicy | None = None,
+    ) -> ProviderResult:
         start = time.monotonic()
         output = dry_response(role, prompt)
         usage = Usage(
@@ -68,19 +80,35 @@ class ProviderCommand:
 
 
 class ProviderAdapter:
-    def build_command(self, config: ProviderConfig, model: ModelInfo, prompt: str, workspace: Path) -> ProviderCommand:
+    def build_command(
+        self,
+        config: ProviderConfig,
+        model: ModelInfo,
+        prompt: str,
+        workspace: Path,
+        _execution_policy: ExecutionPolicy,
+    ) -> ProviderCommand:
         raise NotImplementedError
 
 
 class CodexAdapter(ProviderAdapter):
-    def build_command(self, config: ProviderConfig, model: ModelInfo, prompt: str, workspace: Path) -> ProviderCommand:
+    def build_command(
+        self,
+        config: ProviderConfig,
+        model: ModelInfo,
+        prompt: str,
+        workspace: Path,
+        execution_policy: ExecutionPolicy,
+    ) -> ProviderCommand:
         resolved_workspace = workspace.resolve()
+        permission_args = _codex_permission_args(execution_policy)
         return ProviderCommand(
             [
                 config.command,
                 "exec",
                 "--model",
                 model.name,
+                *permission_args,
                 "--cd",
                 str(resolved_workspace),
                 prompt,
@@ -90,8 +118,16 @@ class CodexAdapter(ProviderAdapter):
 
 
 class CursorAdapter(ProviderAdapter):
-    def build_command(self, config: ProviderConfig, model: ModelInfo, prompt: str, workspace: Path) -> ProviderCommand:
+    def build_command(
+        self,
+        config: ProviderConfig,
+        model: ModelInfo,
+        prompt: str,
+        workspace: Path,
+        execution_policy: ExecutionPolicy,
+    ) -> ProviderCommand:
         resolved_workspace = workspace.resolve()
+        permission_args = _cursor_permission_args(execution_policy)
         return ProviderCommand(
             [
                 config.command,
@@ -103,6 +139,7 @@ class CursorAdapter(ProviderAdapter):
                 "--workspace",
                 str(resolved_workspace),
                 "--trust",
+                *permission_args,
                 prompt,
             ],
             resolved_workspace,
@@ -110,7 +147,14 @@ class CursorAdapter(ProviderAdapter):
 
 
 class ClaudeAdapter(ProviderAdapter):
-    def build_command(self, config: ProviderConfig, model: ModelInfo, prompt: str, workspace: Path) -> ProviderCommand:
+    def build_command(
+        self,
+        config: ProviderConfig,
+        model: ModelInfo,
+        prompt: str,
+        workspace: Path,
+        _execution_policy: ExecutionPolicy,
+    ) -> ProviderCommand:
         resolved_workspace = workspace.resolve()
         return ProviderCommand([config.command, "--model", model.name, prompt], resolved_workspace)
 
@@ -136,7 +180,13 @@ class CLIProvider(Provider):
             return []
         return list(self.config.models)
 
-    def run(self, role: str, model: ModelInfo, prompt: str) -> ProviderResult:
+    def run(
+        self,
+        role: str,
+        model: ModelInfo,
+        prompt: str,
+        execution_policy: ExecutionPolicy | None = None,
+    ) -> ProviderResult:
         start = time.monotonic()
         usage = Usage(input_tokens=estimate_tokens(prompt), exact=False, confidence="estimated")
         adapter = self.adapter
@@ -151,7 +201,8 @@ class CLIProvider(Provider):
             usage.cost_usd = estimate_cost(model, usage)
             return ProviderResult(role, model, prompt, error, usage, time.monotonic() - start, error)
 
-        provider_command = adapter.build_command(self.config, model, prompt, self.workspace)
+        policy = execution_policy or ExecutionPolicy()
+        provider_command = adapter.build_command(self.config, model, prompt, self.workspace, policy)
         try:
             completed = subprocess.run(  # noqa: S603 - provider command is explicit user config, never a shell.
                 provider_command.args,
@@ -198,11 +249,34 @@ class ProviderRouter:
             models.extend(provider.available_models())
         return models
 
-    def run(self, role: str, model: ModelInfo, prompt: str) -> ProviderResult:
+    def run(
+        self,
+        role: str,
+        model: ModelInfo,
+        prompt: str,
+        execution_policy: ExecutionPolicy | None = None,
+    ) -> ProviderResult:
         for provider in self.providers:
             if any(candidate.id == model.id for candidate in provider.available_models()):
-                return provider.run(role, model, prompt)
+                return provider.run(role, model, prompt, execution_policy)
         raise ValueError(f"No provider can run selected model {model.id}")
+
+
+def _codex_permission_args(policy: ExecutionPolicy) -> list[str]:
+    if policy.mode == "full-access":
+        return ["--dangerously-bypass-approvals-and-sandbox"]
+    args = ["--sandbox", policy.mode]
+    for directory in policy.writable_dirs:
+        args.extend(["--add-dir", str(directory.resolve())])
+    return args
+
+
+def _cursor_permission_args(policy: ExecutionPolicy) -> list[str]:
+    if policy.mode == "full-access":
+        return ["--force", "--sandbox", "disabled"]
+    if policy.mode == "read-only":
+        return ["--mode", "plan", "--sandbox", "enabled"]
+    return []
 
 
 def _process_error(returncode: int, stderr: str | None) -> str | None:

@@ -7,6 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .artifacts import write_state, write_text
+from .config import ExecutionConfig
 from .prompts import (
     build_arbiter_prompt,
     build_prompt,
@@ -20,7 +21,7 @@ from .prompts import (
 from .providers import ProviderRouter
 from .reporting import render_report
 from .selection import assign_models
-from .types import ROLES, Clarification, ModelInfo, ProviderResult, RunState, Usage
+from .types import ROLES, Clarification, ExecutionPolicy, ModelInfo, ProviderResult, RunState, Usage
 
 ProgressCallback = Callable[[str, str, RunState, ModelInfo | None, ProviderResult | None, Path | None], None]
 
@@ -37,6 +38,8 @@ def run_planning(
     router: ProviderRouter,
     *,
     auto_accept: bool,
+    execution: ExecutionConfig | None = None,
+    permission_mode: str | None = None,
     progress: ProgressCallback | None = None,
 ) -> RunState:
     models = router.available_models()
@@ -44,7 +47,14 @@ def run_planning(
     run = RunState.create(prompt, runs_dir)
     run.assignments = assignments
     run.warnings.extend(warnings)
-    return complete_planning(run, router, auto_accept=auto_accept, progress=progress)
+    return complete_planning(
+        run,
+        router,
+        auto_accept=auto_accept,
+        execution=execution,
+        permission_mode=permission_mode,
+        progress=progress,
+    )
 
 
 def run_clarification(
@@ -52,6 +62,8 @@ def run_clarification(
     runs_dir: Path,
     router: ProviderRouter,
     *,
+    execution: ExecutionConfig | None = None,
+    permission_mode: str | None = None,
     progress: ProgressCallback | None = None,
 ) -> RunState:
     models = router.available_models()
@@ -66,6 +78,7 @@ def run_clarification(
         "clarifier",
         assignments["planner"].model,
         clarification_prompt(prompt),
+        _execution_policy(execution, "clarifier", permission_mode),
         progress,
     )
     run.results.append(result)
@@ -81,10 +94,20 @@ def complete_planning(
     router: ProviderRouter,
     *,
     auto_accept: bool,
+    execution: ExecutionConfig | None = None,
+    permission_mode: str | None = None,
     progress: ProgressCallback | None = None,
 ) -> RunState:
     planning_prompt = _planning_prompt(run)
-    planner = _run_provider(run, router, "planner", run.assignments["planner"].model, planning_prompt, progress)
+    planner = _run_provider(
+        run,
+        router,
+        "planner",
+        run.assignments["planner"].model,
+        planning_prompt,
+        _execution_policy(execution, "planner", permission_mode),
+        progress,
+    )
     run.results.append(planner)
     write_text(run, "01-draft-plan.md", planner.output)
 
@@ -94,6 +117,7 @@ def complete_planning(
         "plan_reviewer_a",
         run.assignments["plan_reviewer_a"].model,
         plan_review_prompt(planner.output, "reviewer A"),
+        _execution_policy(execution, "plan_reviewer_a", permission_mode),
         progress,
     )
     review_b = _run_provider(
@@ -102,6 +126,7 @@ def complete_planning(
         "plan_reviewer_b",
         run.assignments["plan_reviewer_b"].model,
         plan_review_prompt(planner.output, "reviewer B"),
+        _execution_policy(execution, "plan_reviewer_b", permission_mode),
         progress,
     )
     run.results.extend([review_a, review_b])
@@ -114,6 +139,7 @@ def complete_planning(
         "plan_arbiter",
         run.assignments["plan_arbiter"].model,
         plan_arbiter_prompt(planner.output, review_a.output, review_b.output),
+        _execution_policy(execution, "plan_arbiter", permission_mode),
         progress,
     )
     run.results.append(arbiter)
@@ -143,7 +169,14 @@ def accept_plan(existing: RunState) -> RunState:
     return existing
 
 
-def run_build(existing: RunState, router: ProviderRouter, *, progress: ProgressCallback | None = None) -> RunState:
+def run_build(
+    existing: RunState,
+    router: ProviderRouter,
+    *,
+    execution: ExecutionConfig | None = None,
+    permission_mode: str | None = None,
+    progress: ProgressCallback | None = None,
+) -> RunState:
     if not existing.accepted_plan:
         raise ValueError("Run has no accepted plan. Review the proposed plan, then run the accept command.")
     _ensure_assignments(existing, router)
@@ -155,6 +188,7 @@ def run_build(existing: RunState, router: ProviderRouter, *, progress: ProgressC
         "builder",
         existing.assignments["builder"].model,
         build_prompt(existing.accepted_plan),
+        _execution_policy(execution, "builder", permission_mode),
         progress,
     )
     existing.results.append(build)
@@ -184,6 +218,7 @@ def run_build(existing: RunState, router: ProviderRouter, *, progress: ProgressC
         "build_reviewer_a",
         existing.assignments["build_reviewer_a"].model,
         build_review_prompt(existing.accepted_plan, build.output, "implementation reviewer A"),
+        _execution_policy(execution, "build_reviewer_a", permission_mode),
         progress,
     )
     review_b = _run_provider(
@@ -192,6 +227,7 @@ def run_build(existing: RunState, router: ProviderRouter, *, progress: ProgressC
         "build_reviewer_b",
         existing.assignments["build_reviewer_b"].model,
         build_review_prompt(existing.accepted_plan, build.output, "implementation reviewer B"),
+        _execution_policy(execution, "build_reviewer_b", permission_mode),
         progress,
     )
     existing.results.extend([review_a, review_b])
@@ -204,6 +240,7 @@ def run_build(existing: RunState, router: ProviderRouter, *, progress: ProgressC
         "build_arbiter",
         existing.assignments["build_arbiter"].model,
         build_arbiter_prompt(review_a.output, review_b.output),
+        _execution_policy(execution, "build_arbiter", permission_mode),
         progress,
     )
     existing.results.append(arbiter)
@@ -225,12 +262,14 @@ def _run_provider(
     role: str,
     model: ModelInfo,
     prompt: str,
+    execution_policy: ExecutionPolicy,
     progress: ProgressCallback | None,
 ) -> ProviderResult:
+    run.execution_policies[role] = execution_policy
     if progress:
         progress("start", role, run, model, None, None)
     try:
-        result = router.run(role, model, prompt)
+        result = router.run(role, model, prompt, execution_policy)
     except Exception as exc:
         if progress:
             progress("finish", role, run, model, _failed_provider_result(role, model, prompt, exc), None)
@@ -244,6 +283,14 @@ def _run_provider(
 def _failed_provider_result(role: str, model: ModelInfo, prompt: str, exc: Exception) -> ProviderResult:
     error = str(exc)
     return ProviderResult(role, model, prompt, error, Usage(), 0.0, error)
+
+
+def _execution_policy(
+    execution: ExecutionConfig | None,
+    role: str,
+    permission_mode: str | None,
+) -> ExecutionPolicy:
+    return (execution or ExecutionConfig()).policy_for_role(role, mode_override=permission_mode)
 
 
 def _workspace_changes(workspace: Path) -> str | None:
