@@ -39,16 +39,22 @@ def expand_with_dependencies(selected: Sequence[str], recommendations: Sequence[
     by_id = {rec.id: rec for rec in recommendations}
     ordered: list[str] = []
     seen: set[str] = set()
+    visiting: set[str] = set()
 
     def visit(rec_id: str) -> None:
+        if rec_id in seen:
+            return
         rec = by_id.get(rec_id)
         if rec is None:
             return
+        if rec_id in visiting:
+            return
+        visiting.add(rec_id)
         for dependency in rec.depends_on:
             visit(dependency)
-        if rec_id not in seen:
-            seen.add(rec_id)
-            ordered.append(rec_id)
+        visiting.discard(rec_id)
+        seen.add(rec_id)
+        ordered.append(rec_id)
 
     for rec_id in selected:
         visit(rec_id)
@@ -91,7 +97,9 @@ def _parse_embedded_json(markdown: str) -> list[BuildRecommendation]:
     if _MARKER_OPEN not in markdown:
         return []
     start = markdown.index(_MARKER_OPEN) + len(_MARKER_OPEN)
-    end = markdown.index(_MARKER_CLOSE, start)
+    end = markdown.find(_MARKER_CLOSE, start)
+    if end == -1:
+        return []
     payload = markdown[start:end].strip()
     try:
         raw_items = json.loads(payload)

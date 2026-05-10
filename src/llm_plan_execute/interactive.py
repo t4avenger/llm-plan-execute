@@ -116,7 +116,9 @@ class InteractiveSession:
             if raw is None:
                 raise InteractiveCanceledError("EOF while confirming.")
             token = raw.strip().lower()
-            if token in {"", "y", "yes"}:
+            if token == "":
+                return default_yes
+            if token in {"y", "yes"}:
                 return True
             if token in {"n", "no"}:
                 return False

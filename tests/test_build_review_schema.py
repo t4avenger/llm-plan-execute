@@ -63,6 +63,21 @@ def test_missing_dependency_id_not_in_list_reports():
     assert "not-a-rec" in msg
 
 
+def test_expand_with_dependencies_handles_cycles():
+    recs = [
+        BuildRecommendation(id="a", title="a", description="", depends_on=("b",)),
+        BuildRecommendation(id="b", title="b", description="", depends_on=("a",)),
+    ]
+    expanded = expand_with_dependencies(["a"], recs)
+    assert set(expanded) == {"a", "b"}
+
+
+def test_unclosed_embedded_marker_does_not_raise():
+    md = '<!-- llm-plan-execute:recommendations\n[{"id": "x", "title": "t", "description": "d"}]\n'
+    recs = parse_recommendations_from_summary(md)
+    assert isinstance(recs, list)
+
+
 def test_selection_requires_missing_dependency_direct():
     recs = [
         BuildRecommendation(id="r2", title="two", description="", depends_on=("r1",)),

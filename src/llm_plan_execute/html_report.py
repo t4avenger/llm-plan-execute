@@ -20,20 +20,21 @@ def write_html_report(run: RunState) -> Path:
     """Write UTF-8 HTML alongside Markdown artifacts."""
     path = deterministic_html_report_path(run.run_dir)
     markdown = render_report(run)
-    body = html.escape(markdown)
-    wrapped = "<br>\n".join(body.splitlines())
+    escaped = html.escape(markdown)
     title = html.escape(f"Run {run.run_id}")
     document = (
         "<!DOCTYPE html>\n"
         '<html lang="en">\n'
         "<head>\n"
         f'<meta charset="utf-8"><title>{title}</title>\n'
+        '<meta http-equiv="Content-Security-Policy" '
+        "content=\"default-src 'none'; base-uri 'none'; style-src 'unsafe-inline'\">\n"
         "<style>body{font-family:system-ui,Segoe UI,sans-serif;margin:1.5rem;line-height:1.5}"
-        "pre{white-space:pre-wrap}</style>\n"
+        "pre{white-space:pre-wrap;word-break:break-word}</style>\n"
         "</head>\n"
         "<body>\n"
         f"<h1>{title}</h1>\n"
-        f"<pre>{wrapped}</pre>\n"
+        f"<pre>{escaped}</pre>\n"
         "</body>\n"
         "</html>\n"
     )

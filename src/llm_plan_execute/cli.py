@@ -35,15 +35,13 @@ from .types import (
     RunState,
     Usage,
 )
-from .workflow import BuildFailedError, accept_plan, run_build, run_planning
+from .workflow import accept_plan, run_planning
 from .workflow_runner import (
-    finalize_completion_reports,
+    execute_build_through_completion,
     gate_stage_transition,
-    interactive_build_review_loop,
     interactive_plan_review,
     merge_execution_dirs,
     orchestrate_clarification,
-    resolve_build_permission,
 )
 from .workflow_state import WorkflowState, load_workflow_state, save_workflow_state
 
@@ -438,6 +436,8 @@ def _run_accept_plan_phase(
     if reviewed is None:
         print(f"Report: {run.run_dir / 'report.md'}")
         return 130
+    wf.stage = "pre_build"
+    save_workflow_state(reviewed.run_dir, wf)
     return reviewed
 
 
@@ -472,48 +472,17 @@ def _run_build_review_completion(
     run: RunState,
     progress: ProgressReporter,
 ) -> int:
-    build_permission = args.permission_mode or resolve_build_permission(execution.build_mode, session)
-    try:
-        run = run_build(
-            run,
-            router,
-            execution=execution,
-            permission_mode=build_permission,
-            progress=progress.update,
-            runs_root=app_config.runs_dir,
-        )
-    except BuildFailedError as exc:
-        run = exc.run
-        wf.lifecycle_status = "failed"
-        save_workflow_state(run.run_dir, wf)
-        print(f"Build failed: {run.run_dir / '05-build-output.md'}")
-        print(f"Report: {run.run_dir / 'report.md'}")
-        return 1
-
-    wf.stage = "build_review"
-    save_workflow_state(run.run_dir, wf)
-    review_outcome = interactive_build_review_loop(
-        session=session,
+    _, exit_code = execute_build_through_completion(
         run=run,
+        wf=wf,
         router=router,
         execution=execution,
-        permission_mode=build_permission,
+        session=session,
+        permission_mode_cli=args.permission_mode,
         progress=progress.update,
-        wf=wf,
+        runs_root=app_config.runs_dir,
     )
-    if review_outcome == "cancel":
-        print(f"Report: {run.run_dir / 'report.md'}")
-        return 130
-
-    completion = finalize_completion_reports(session=session, run=run, wf=wf)
-    if completion == "cancel":
-        print(f"Report: {run.run_dir / 'report.md'}")
-        return 130
-
-    print(f"Build output: {run.run_dir / '05-build-output.md'}")
-    print(f"Review summary: {run.run_dir / '08-build-review-summary.md'}")
-    print(f"Report: {run.run_dir / 'report.md'}")
-    return 0
+    return exit_code
 
 
 def _cmd_run(
@@ -590,48 +559,17 @@ def _cmd_build(
             print(f"Report: {run.run_dir / 'report.md'}")
             return 130
 
-    build_permission = args.permission_mode or resolve_build_permission(execution.build_mode, session)
-    try:
-        run = run_build(
-            run,
-            router,
-            execution=execution,
-            permission_mode=build_permission,
-            progress=progress.update,
-            runs_root=app_config.runs_dir,
-        )
-    except BuildFailedError as exc:
-        run = exc.run
-        wf.lifecycle_status = "failed"
-        save_workflow_state(run.run_dir, wf)
-        print(f"Build failed: {run.run_dir / '05-build-output.md'}")
-        print(f"Report: {run.run_dir / 'report.md'}")
-        return 1
-
-    wf.stage = "build_review"
-    save_workflow_state(run.run_dir, wf)
-    review_outcome = interactive_build_review_loop(
-        session=session,
+    _, exit_code = execute_build_through_completion(
         run=run,
+        wf=wf,
         router=router,
         execution=execution,
-        permission_mode=build_permission,
+        session=session,
+        permission_mode_cli=args.permission_mode,
         progress=progress.update,
-        wf=wf,
+        runs_root=app_config.runs_dir,
     )
-    if review_outcome == "cancel":
-        print(f"Report: {run.run_dir / 'report.md'}")
-        return 130
-
-    completion = finalize_completion_reports(session=session, run=run, wf=wf)
-    if completion == "cancel":
-        print(f"Report: {run.run_dir / 'report.md'}")
-        return 130
-
-    print(f"Build output: {run.run_dir / '05-build-output.md'}")
-    print(f"Review summary: {run.run_dir / '08-build-review-summary.md'}")
-    print(f"Report: {run.run_dir / 'report.md'}")
-    return 0
+    return exit_code
 
 
 def _cmd_report(args: argparse.Namespace, app_config: AppConfig) -> int:

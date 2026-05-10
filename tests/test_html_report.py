@@ -11,6 +11,8 @@ def test_html_report_path_is_stable(tmp_path):
     text = path.read_text(encoding="utf-8")
     assert "<!DOCTYPE html>" in text
     assert run.run_id in text
+    assert "Content-Security-Policy" in text
+    assert "<pre>" in text
 
 
 def test_markdown_report_coexists_with_html(tmp_path):

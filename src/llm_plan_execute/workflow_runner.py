@@ -42,12 +42,14 @@ from .providers import ProviderRouter
 from .reporting import render_report
 from .types import PERMISSION_MODES, RunState
 from .workflow import (
+    BuildFailedError,
     accept_plan,
     complete_planning,
     record_build_recommendation_application,
     render_clarification,
     rerun_build_review,
     revise_proposed_plan,
+    run_build,
     run_clarification,
     run_planning,
 )
@@ -267,6 +269,7 @@ def interactive_build_review_loop(
 
         if decision.type == "cancel":
             wf.lifecycle_status = "canceled"
+            wf.build_review_selected_ids = []
             save_workflow_state(run.run_dir, wf)
             return "cancel"
         if decision.type == "continueWithoutApplying":
@@ -291,6 +294,8 @@ def interactive_build_review_loop(
             continue
 
         selected_ids = _resolve_build_review_selection(decision, recommendations, session)
+        wf.build_review_selected_ids = list(selected_ids)
+        save_workflow_state(run.run_dir, wf)
         expanded = expand_with_dependencies(selected_ids, recommendations)
         missing = selection_requires_missing_dependency(expanded, recommendations)
         if missing:
@@ -301,6 +306,62 @@ def interactive_build_review_loop(
         record_build_recommendation_application(run, recommendations, expanded)
         _write_apply_follow_up_notes(run, recommendations, expanded)
         return None
+
+
+def execute_build_through_completion(
+    *,
+    run: RunState,
+    wf: WorkflowState,
+    router: ProviderRouter,
+    execution: ExecutionConfig,
+    session: InteractiveSession,
+    permission_mode_cli: str | None,
+    progress: ProgressHook,
+    runs_root: Path,
+) -> tuple[RunState, int]:
+    """Run build, build-review loop, and completion reporting; return final run state and exit code."""
+    build_permission = permission_mode_cli or resolve_build_permission(execution.build_mode, session)
+    try:
+        run = run_build(
+            run,
+            router,
+            execution=execution,
+            permission_mode=build_permission,
+            progress=progress,
+            runs_root=runs_root,
+        )
+    except BuildFailedError as exc:
+        run = exc.run
+        wf.lifecycle_status = "failed"
+        save_workflow_state(run.run_dir, wf)
+        print(f"Build failed: {run.run_dir / '05-build-output.md'}")
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return run, 1
+
+    wf.stage = "build_review"
+    save_workflow_state(run.run_dir, wf)
+    review_outcome = interactive_build_review_loop(
+        session=session,
+        run=run,
+        router=router,
+        execution=execution,
+        permission_mode=build_permission,
+        progress=progress,
+        wf=wf,
+    )
+    if review_outcome == "cancel":
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return run, 130
+
+    completion = finalize_completion_reports(session=session, run=run, wf=wf)
+    if completion == "cancel":
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return run, 130
+
+    print(f"Build output: {run.run_dir / '05-build-output.md'}")
+    print(f"Review summary: {run.run_dir / '08-build-review-summary.md'}")
+    print(f"Report: {run.run_dir / 'report.md'}")
+    return run, 0
 
 
 def finalize_completion_reports(*, session: InteractiveSession, run: RunState, wf: WorkflowState) -> str | None:

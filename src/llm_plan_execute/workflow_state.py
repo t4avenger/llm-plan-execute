@@ -60,7 +60,7 @@ class WorkflowState:
             build_review_applied_ids=_string_list(raw.get("build_review_applied_ids")),
             report_markdown_path=_optional_str(raw.get("report_markdown_path")) or "report.md",
             report_html_path=_optional_str(raw.get("report_html_path")),
-            terminal_report_printed=bool(raw.get("terminal_report_printed", False)),
+            terminal_report_printed=_read_bool(raw.get("terminal_report_printed")),
         )
 
 
@@ -122,6 +122,10 @@ def _optional_int(value: object) -> int | None:
 
 def _optional_str(value: object) -> str | None:
     return value if isinstance(value, str) else None
+
+
+def _read_bool(value: object) -> bool:
+    return value is True
 
 
 def _string_list(value: object) -> list[str]:
