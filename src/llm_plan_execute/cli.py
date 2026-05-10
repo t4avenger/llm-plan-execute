@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
 from .artifacts import load_state
-from .config import DEFAULT_CONFIG, load_config, write_sample_config
+from .config import (
+    DEFAULT_CONFIG,
+    ConfigIssue,
+    ConfigValidation,
+    format_validation,
+    load_config,
+    validate_config_file,
+    write_sample_config,
+)
 from .providers import ProviderRouter
 from .reporting import render_report
 from .selection import assign_models
@@ -23,6 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     init = sub.add_parser("init-config", help="Write a sample local config.")
     init.add_argument("--path", type=Path, default=DEFAULT_CONFIG)
+
+    config = sub.add_parser("config", help="Inspect and validate configuration.")
+    config_sub = config.add_subparsers(dest="config_command", required=True)
+    config_sub.add_parser("validate", help="Validate config shape and provider command availability.")
 
     sub.add_parser("models", help="List available models and role assignments.")
 
@@ -53,14 +66,21 @@ def _run(argv: list[str] | None = None) -> int:
     if args.command == "init-config":
         return _cmd_init_config(args)
 
-    config = load_config(args.config, dry_run=args.dry_run)
-    router = ProviderRouter.from_config(config)
+    if args.command == "config":
+        return _cmd_config(args)
 
+    app_config = load_config(args.config, dry_run=args.dry_run)
+    router = ProviderRouter.from_config(app_config)
+
+    return _dispatch_command(args, router, app_config.runs_dir)
+
+
+def _dispatch_command(args: argparse.Namespace, router: ProviderRouter, runs_dir: Path) -> int:
     if args.command == "models":
         return _cmd_models(router)
 
     if args.command == "plan":
-        return _cmd_plan(args, router, config.runs_dir)
+        return _cmd_plan(args, router, runs_dir)
 
     if args.command == "build":
         return _cmd_build(args, router)
@@ -74,6 +94,44 @@ def _run(argv: list[str] | None = None) -> int:
 def _cmd_init_config(args: argparse.Namespace) -> int:
     path = write_sample_config(args.path)
     print(f"Wrote {path}")
+    return 0
+
+
+def _cmd_config(args: argparse.Namespace) -> int:
+    if args.config_command != "validate":
+        return 1
+
+    validation = validate_config_file(args.config, dry_run=args.dry_run)
+    if validation.errors:
+        print(format_validation(validation), file=sys.stderr)
+        return 1
+
+    config = load_config(args.config, dry_run=args.dry_run)
+    command_errors: list[ConfigIssue] = []
+    if not config.dry_run:
+        command_errors = [
+            ConfigIssue(
+                "error",
+                f"providers[{index}].command",
+                f"enabled provider {provider.name!r} command {provider.command!r} was not found on PATH",
+            )
+            for index, provider in enumerate(config.providers)
+            if provider.enabled and shutil.which(provider.command) is None
+        ]
+    command_warnings = list(validation.warnings)
+    for index, provider in enumerate(config.providers):
+        if not provider.enabled:
+            command_warnings.append(
+                ConfigIssue("warning", f"providers[{index}]", f"provider {provider.name!r} is disabled")
+            )
+
+    if command_errors:
+        print(format_validation(ConfigValidation(tuple(command_errors), tuple(command_warnings))), file=sys.stderr)
+        return 1
+    if command_warnings:
+        print(format_validation(ConfigValidation((), tuple(command_warnings))))
+    else:
+        print("Config is valid.")
     return 0
 
 

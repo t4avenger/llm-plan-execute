@@ -17,3 +17,6 @@ This project uses Architecture Decision Records (ADRs) to capture decisions that
 - [0003 Use deterministic model selection from a capability registry](0003-use-deterministic-model-selection.md)
 - [0004 Scaffold provider skills in the repository](0004-scaffold-provider-skills-in-repository.md)
 - [0005 Report exact usage when available and estimates otherwise](0005-exact-or-estimated-usage-reporting.md)
+- [0006 Use provider-specific command adapters](0006-use-provider-specific-command-adapters.md)
+- [0007 Split quality and Sonar workflows](0007-split-quality-and-sonar-workflows.md)
+- [0008 Validate local provider config](0008-validate-local-provider-config.md)
