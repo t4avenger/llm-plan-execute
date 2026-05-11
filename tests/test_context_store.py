@@ -13,9 +13,12 @@ import pytest
 
 from llm_plan_execute.context_store import (
     DEFAULT_MAX_CONTENT_BYTES,
+    TRUNCATION_MARKER,
     ContextStore,
     ContextStoreError,
     ContextStoreLockedError,
+    cosine_similarity,
+    ensure_context_gitignore,
     redact_secrets,
     row_to_embedding_record,
     truncate_content,
@@ -32,6 +35,27 @@ def test_redact_and_truncate() -> None:
     cut = truncate_content(long_text)
     assert len(cut.encode("utf-8")) <= DEFAULT_MAX_CONTENT_BYTES + 200
     assert "truncated" in cut.lower()
+
+
+def test_truncate_content_marker_only_when_budget_equals_marker_length() -> None:
+    marker_bytes = len(TRUNCATION_MARKER.encode("utf-8"))
+    text = "z" * (marker_bytes + 1)
+    assert truncate_content(text, max_bytes=marker_bytes) == TRUNCATION_MARKER
+
+
+def test_cosine_similarity_zero_norm() -> None:
+    assert cosine_similarity([0.0, 0.0], [1.0, 2.0]) == 0.0
+    assert cosine_similarity([3.0, 4.0], [0.0, 0.0]) == 0.0
+
+
+def test_ensure_context_gitignore_appends_without_trailing_newline(tmp_path: Path) -> None:
+    path = tmp_path / ".gitignore"
+    path.write_text("keep\nthis", encoding="utf-8")
+    written = ensure_context_gitignore(tmp_path)
+    assert written == path
+    body = path.read_text(encoding="utf-8")
+    assert ".llm-plan-execute/" in body.splitlines()
+    assert body.endswith(".llm-plan-execute/\n")
 
 
 def test_context_init_search_fts(tmp_path: Path) -> None:
@@ -83,6 +107,91 @@ def test_concurrent_writer_lock(tmp_path: Path) -> None:
     t1.join()
     t2.join()
     assert errors
+
+
+def test_embed_item_unknown_context_item_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = ContextStore(tmp_path)
+    store.init()
+
+    def boom(_m: str) -> object:
+        raise AssertionError("_load_fastembed_provider should not run without a row")
+
+    monkeypatch.setattr("llm_plan_execute.context_store._load_fastembed_provider", boom)
+    with pytest.raises(ContextStoreError, match="Unknown context item"):
+        store.embed_item("does-not-exist")
+
+
+def test_embed_item_raises_when_existing_embeddings_differ_from_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ContextStore(tmp_path)
+    store.init()
+    store.add_context_item(task_id="t1", kind="note", path=None, content="hello", metadata={})
+    conn = store._connect()
+    try:
+        cid = str(conn.execute("SELECT id FROM context_items LIMIT 1").fetchone()[0])
+        conn.execute(
+            """
+            INSERT INTO embeddings(context_item_id, provider, model, dim, vector_blob, created_at)
+            VALUES (?, 'fastembed', 'stored-model', 2, ?, 'now')
+            """,
+            (cid, sqlite3.Binary(b"\x00\x00\x00\x00")),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    class Fake:
+        name = "fastembed"
+
+        def embed(self, _t: str) -> list[float]:
+            return [1.0, 0.0]
+
+    monkeypatch.setattr("llm_plan_execute.context_store._load_fastembed_provider", lambda _m: Fake())
+    with pytest.raises(ContextStoreError, match="different provider/model"):
+        store.embed_item(cid, model="other-model")
+
+
+def test_search_context_raises_when_multiple_embedding_pairs(tmp_path: Path) -> None:
+    store = ContextStore(tmp_path)
+    store.init()
+    store.add_context_item(task_id="t1", kind="note", path=None, content="hello", metadata={})
+    conn = store._connect()
+    try:
+        cid = str(conn.execute("SELECT id FROM context_items LIMIT 1").fetchone()[0])
+        conn.execute(
+            """
+            INSERT INTO embeddings(context_item_id, provider, model, dim, vector_blob, created_at)
+            VALUES (?, 'p1', 'm1', 2, ?, 'now')
+            """,
+            (cid, sqlite3.Binary(b"\x00\x00\x00\x00")),
+        )
+        conn.execute(
+            """
+            INSERT INTO embeddings(context_item_id, provider, model, dim, vector_blob, created_at)
+            VALUES (?, 'p2', 'm2', 2, ?, 'now')
+            """,
+            (cid, sqlite3.Binary(b"\x00\x00\x00\x00")),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(ContextStoreError, match="Multiple embedding"):
+        store.search_context("hello", task_id="t1")
+
+
+def test_search_context_whitespace_only_query_returns_empty(tmp_path: Path) -> None:
+    store = ContextStore(tmp_path)
+    store.init()
+    assert store.search_context("  \t ") == []
+
+
+def test_search_context_min_score_excludes_fts_hits(tmp_path: Path) -> None:
+    store = ContextStore(tmp_path)
+    store.init()
+    store.add_context_item(task_id="t1", kind="note", path=None, content="hello world", metadata={})
+    assert store.search_context("hello", task_id="t1", min_score=1.01) == []
 
 
 def test_embedding_import_error_when_fastembed_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
