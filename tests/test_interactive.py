@@ -1,6 +1,11 @@
 import pytest
 
-from llm_plan_execute.interactive import InteractiveCanceledError, session_with_mock_stdin
+from llm_plan_execute.interactive import (
+    InteractiveCanceledError,
+    InteractiveSession,
+    ListBuffer,
+    session_with_mock_stdin,
+)
 
 
 def test_prompt_confirm_empty_input_respects_default_no():
@@ -78,7 +83,7 @@ def test_menu_helpers_return_typed_decisions_and_non_interactive_defaults():
 
 
 def test_slash_commands_and_escaped_input():
-    session, _stdout, stderr = session_with_mock_stdin(["/help", "/continue"])
+    session, _stdout, _stderr = session_with_mock_stdin(["/help", "/continue"])
     assert session.ask_stage_transition().type == "proceed"
 
     unknown, _stdout2, err2 = session_with_mock_stdin(["/wat", "1"])
@@ -92,7 +97,6 @@ def test_slash_commands_and_escaped_input():
 
 def test_ctrl_c_first_press_warns_second_cancels():
     """First Ctrl-C warns; second Ctrl-C raises InteractiveCanceledError."""
-    from llm_plan_execute.interactive import InteractiveSession, ListBuffer
 
     class _CtrlCThenValidStdin:
         def __init__(self, responses):

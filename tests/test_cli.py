@@ -1,10 +1,12 @@
 import io
 import json
+import os
 from pathlib import Path
 
 from llm_plan_execute.cli import _state_from_json, main
 from llm_plan_execute.config import sample_config
 from llm_plan_execute.interactive import session_with_mock_stdin
+from llm_plan_execute.workflow_state import workflow_lock_path
 
 CLARIFICATION_NEEDED_EXIT = 2
 CANCELED_EXIT = 130
@@ -563,8 +565,6 @@ def test_complete_stage_is_reached_after_full_non_interactive_run(tmp_path, caps
 
 def test_force_session_overrides_stale_lock(tmp_path, capsys):
     """--force-session lets build proceed when a stale lock file is present."""
-    from llm_plan_execute.workflow_state import workflow_lock_path
-
     config = _write_dry_config(tmp_path)
     main([*_config_args(tmp_path, config), "plan", "--prompt", "Add feature", "--no-clarify", "--yes"])
     captured = capsys.readouterr()
@@ -591,10 +591,6 @@ def test_force_session_overrides_stale_lock(tmp_path, capsys):
 
 def test_build_without_force_session_fails_on_live_lock(tmp_path, capsys):
     """Without --force-session, a live-PID lock raises an error."""
-    import os
-
-    from llm_plan_execute.workflow_state import workflow_lock_path
-
     config = _write_dry_config(tmp_path)
     main([*_config_args(tmp_path, config), "plan", "--prompt", "Add feature", "--no-clarify", "--yes"])
     captured = capsys.readouterr()
