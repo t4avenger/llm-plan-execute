@@ -19,7 +19,7 @@ WorkflowStage = Literal[
 ]
 
 WorkflowLifecycleStatus = Literal["active", "paused", "completed", "failed", "canceled"]
-CURRENT_WORKFLOW_SCHEMA_VERSION = 2
+CURRENT_WORKFLOW_SCHEMA_VERSION = 3
 WORKFLOW_STATE_LOCK_FILENAME = ".workflow-state.lock"
 
 
@@ -57,6 +57,10 @@ class WorkflowState:
     report_markdown_path: str | None = "report.md"
     report_html_path: str | None = None
     terminal_report_printed: bool = False
+    task_id: str | None = None
+    branch: str | None = None
+    base_branch: str | None = None
+    context_db_path: str | None = None
 
     def touch_accepted_plan(self, *, artifact_name: str = "04-accepted-plan.md") -> None:
         self.accepted_plan_artifact = artifact_name
@@ -83,6 +87,10 @@ class WorkflowState:
             report_markdown_path=_optional_str(raw.get("report_markdown_path")) or "report.md",
             report_html_path=_optional_str(raw.get("report_html_path")),
             terminal_report_printed=_read_bool(raw.get("terminal_report_printed")),
+            task_id=_optional_str(raw.get("task_id")),
+            branch=_optional_str(raw.get("branch")),
+            base_branch=_optional_str(raw.get("base_branch")),
+            context_db_path=_optional_str(raw.get("context_db_path")),
         )
 
 

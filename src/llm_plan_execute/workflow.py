@@ -26,7 +26,7 @@ from .prompts import (
 from .providers import ProviderRouter
 from .reporting import render_report
 from .selection import assign_models
-from .types import ROLES, Clarification, ExecutionPolicy, ModelInfo, ProviderResult, RunState, Usage
+from .types import ROLES, Clarification, ExecutionPolicy, ModelInfo, ProviderActivity, ProviderResult, RunState, Usage
 
 ProgressCallback = Callable[[str, str, RunState, ModelInfo | None, ProviderResult | None, Path | None], None]
 _PROPOSED_PLAN_ARTIFACT = "04-proposed-plan.md"
@@ -265,6 +265,66 @@ def record_build_recommendation_application(
     write_state(run)
 
 
+def apply_build_recommendation_fixes(
+    existing: RunState,
+    router: ProviderRouter,
+    recommendations_text: str,
+    *,
+    execution: ExecutionConfig | None = None,
+    permission_mode: str | None = None,
+    progress: ProgressCallback | None = None,
+    runs_root: Path | None = None,
+) -> RunState:
+    if not existing.accepted_plan or not existing.build_output:
+        raise ValueError("Run must include accepted plan and build output before applying review fixes.")
+
+    prompt = "\n\n".join(
+        [
+            "Apply the selected build-review recommendations to the workspace.",
+            "Accepted plan:",
+            existing.accepted_plan,
+            "Current build output:",
+            existing.build_output,
+            "Selected recommendations:",
+            recommendations_text,
+            "Make the code changes, update or add tests when needed, and summarize what changed.",
+        ]
+    )
+    before_changes = _workspace_changes(router.workspace, exclude_runs_under=runs_root)
+    build = _run_provider(
+        existing,
+        router,
+        "builder",
+        existing.assignments["builder"].model,
+        prompt,
+        _execution_policy(execution, "builder", permission_mode),
+        progress,
+    )
+    existing.results.append(build)
+    existing.build_output = build.output
+    write_text(existing, "11-build-review-fix-output.md", build.output)
+    after_changes = _workspace_changes(router.workspace, exclude_runs_under=runs_root)
+    failure = _build_failure(existing, build, before_changes, after_changes, router.dry_run)
+    if failure:
+        existing.build_status = "failed"
+        existing.build_failure = failure
+        existing.warnings.append(f"Build review fix failed: {failure}")
+        write_state(existing)
+        write_text(existing, "report.md", render_report(existing))
+        raise BuildFailedError(failure, existing)
+    existing.build_status = "succeeded"
+    write_state(existing)
+    write_text(existing, "report.md", render_report(existing))
+    return rerun_build_review(
+        existing,
+        router,
+        execution=execution,
+        permission_mode=permission_mode,
+        progress=progress,
+        feedback_history=["Verify the selected build-review recommendations were applied."],
+    )
+
+
 def accept_plan(existing: RunState) -> RunState:
     if existing.build_output:
         raise ValueError("Run already has build output and cannot accept a different plan.")
@@ -405,7 +465,13 @@ def _run_provider(
         progress("start", role, run, model, None, None)
     with _provider_heartbeat(progress, role, run, model):
         try:
-            result = router.run(role, model, prompt, execution_policy)
+            activity = None
+            if progress:
+
+                def activity(item: ProviderActivity) -> None:
+                    _emit_provider_activity(progress, run, item)
+
+            result = router.run(role, model, prompt, execution_policy, activity)
         except Exception as exc:
             if progress:
                 progress("finish", role, run, model, _failed_provider_result(role, model, prompt, exc), None)
@@ -415,6 +481,13 @@ def _run_provider(
         if progress:
             progress("finish", role, run, model, result, None)
         return result
+
+
+def _emit_provider_activity(progress: ProgressCallback, run: RunState, activity: ProviderActivity) -> None:
+    # Keep the normalized event object available to richer progress reporters without
+    # changing the public callback signature used by older tests.
+    run._last_provider_activity = activity  # type: ignore[attr-defined]
+    progress("activity", activity.role, run, activity.model, None, None)
 
 
 def _failed_provider_result(role: str, model: ModelInfo, prompt: str, exc: Exception) -> ProviderResult:

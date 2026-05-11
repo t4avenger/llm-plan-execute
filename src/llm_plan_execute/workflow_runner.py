@@ -31,6 +31,8 @@ from .build_review_schema import (
     selection_requires_missing_dependency,
 )
 from .config import ExecutionConfig, normalize_writable_dirs
+from .context_store import ContextStore
+from .git_flow import GitFlowError, commit_checkpoint, find_git_root, git_changed_pathspecs, maybe_offer_github_pr
 from .html_report import deterministic_html_report_path, write_html_report
 from .interactive import (
     BuildReviewDecision,
@@ -44,6 +46,7 @@ from .types import PERMISSION_MODES, RunState
 from .workflow import (
     BuildFailedError,
     accept_plan,
+    apply_build_recommendation_fixes,
     complete_planning,
     record_build_recommendation_application,
     render_clarification,
@@ -247,7 +250,7 @@ def resolve_build_permission(default_mode: str, session: InteractiveSession) -> 
     return session.prompt_choice(f"Choose builder permission mode (workspace default: {default_mode}):", choices)
 
 
-def interactive_build_review_loop(  # noqa: C901
+def interactive_build_review_loop(
     *,
     session: InteractiveSession,
     run: RunState,
@@ -256,6 +259,7 @@ def interactive_build_review_loop(  # noqa: C901
     permission_mode: str | None,
     progress: ProgressHook,
     wf: WorkflowState,
+    runs_root: Path | None = None,
 ) -> str | None:
     """Return ``cancel`` when canceled; otherwise ``None``."""
     summary_path = run.run_dir / "08-build-review-summary.md"
@@ -273,45 +277,127 @@ def interactive_build_review_loop(  # noqa: C901
         wf.build_review_selected_action = decision.type
         save_workflow_state(run.run_dir, wf)
 
-        if decision.type == "cancel":
-            wf.lifecycle_status = "canceled"
-            wf.build_review_selected_ids = []
-            save_workflow_state(run.run_dir, wf)
-            return "cancel"
-        if decision.type == "continueWithoutApplying":
-            wf.build_review_selected_ids = []
-            save_workflow_state(run.run_dir, wf)
-            return None
+        terminal = _handle_build_review_terminal_decision(decision, wf, run)
+        if terminal is not False:
+            return terminal
         if decision.type == "feedback":
-            feedback = session.read_build_feedback()
-            if session.non_interactive and not feedback:
-                continue
-            wf.build_review_feedback_history.append(feedback)
-            save_workflow_state(run.run_dir, wf)
-            run = rerun_build_review(
+            run = _handle_build_review_feedback(
+                session,
                 run,
                 router,
                 execution=execution,
                 permission_mode=permission_mode,
                 progress=progress,
-                feedback_history=wf.build_review_feedback_history,
+                wf=wf,
             )
-            save_workflow_state(run.run_dir, wf)
             continue
 
-        selected_ids = _resolve_build_review_selection(decision, recommendations, session)
-        wf.build_review_selected_ids = list(selected_ids)
+        outcome = _apply_build_review_decision(
+            decision,
+            recommendations,
+            session=session,
+            run=run,
+            router=router,
+            execution=execution,
+            permission_mode=permission_mode,
+            progress=progress,
+            wf=wf,
+            runs_root=runs_root,
+        )
+        if isinstance(outcome, str):
+            if outcome == "retry":
+                continue
+            return outcome
+        run = outcome
+
+
+def _handle_build_review_terminal_decision(
+    decision: BuildReviewDecision,
+    wf: WorkflowState,
+    run: RunState,
+) -> str | None | bool:
+    if decision.type == "cancel":
+        wf.lifecycle_status = "canceled"
+        wf.build_review_selected_ids = []
         save_workflow_state(run.run_dir, wf)
-        expanded = expand_with_dependencies(selected_ids, recommendations)
-        missing = selection_requires_missing_dependency(expanded, recommendations)
-        if missing:
-            print(missing)
-            continue
-        wf.build_review_applied_ids = list(expanded)
+        return "cancel"
+    if decision.type == "continueWithoutApplying":
+        wf.build_review_selected_ids = []
         save_workflow_state(run.run_dir, wf)
-        record_build_recommendation_application(run, recommendations, expanded)
-        _write_apply_follow_up_notes(run, recommendations, expanded)
         return None
+    return False
+
+
+def _handle_build_review_feedback(
+    session: InteractiveSession,
+    run: RunState,
+    router: ProviderRouter,
+    *,
+    execution: ExecutionConfig,
+    permission_mode: str | None,
+    progress: ProgressHook,
+    wf: WorkflowState,
+) -> RunState:
+    feedback = session.read_build_feedback()
+    if session.non_interactive and not feedback:
+        return run
+    wf.build_review_feedback_history.append(feedback)
+    save_workflow_state(run.run_dir, wf)
+    rerun = rerun_build_review(
+        run,
+        router,
+        execution=execution,
+        permission_mode=permission_mode,
+        progress=progress,
+        feedback_history=wf.build_review_feedback_history,
+    )
+    save_workflow_state(run.run_dir, wf)
+    return rerun
+
+
+def _apply_build_review_decision(
+    decision: BuildReviewDecision,
+    recommendations: list[BuildRecommendation],
+    *,
+    session: InteractiveSession,
+    run: RunState,
+    router: ProviderRouter,
+    execution: ExecutionConfig,
+    permission_mode: str | None,
+    progress: ProgressHook,
+    wf: WorkflowState,
+    runs_root: Path | None,
+) -> RunState | str:
+    selected_ids = _resolve_build_review_selection(decision, recommendations, session)
+    wf.build_review_selected_ids = list(selected_ids)
+    save_workflow_state(run.run_dir, wf)
+    expanded = expand_with_dependencies(selected_ids, recommendations)
+    missing = selection_requires_missing_dependency(expanded, recommendations)
+    if missing:
+        print(missing)
+        return "retry"
+    wf.build_review_applied_ids = list(expanded)
+    save_workflow_state(run.run_dir, wf)
+    record_build_recommendation_application(run, recommendations, expanded)
+    recommendations_text = _write_apply_follow_up_notes(run, recommendations, expanded) or ""
+    try:
+        _emit_local_progress(progress, run, "applying selected build-review recommendations")
+        rerun = apply_build_recommendation_fixes(
+            run,
+            router,
+            recommendations_text,
+            execution=execution,
+            permission_mode=permission_mode,
+            progress=progress,
+            runs_root=runs_root,
+        )
+    except BuildFailedError as exc:
+        wf.lifecycle_status = "failed"
+        save_workflow_state(exc.run.run_dir, wf)
+        print(f"Build review fix failed: {exc.run.run_dir / '11-build-review-fix-output.md'}")
+        return "failed"
+        _checkpoint_review_fixes(router.workspace, rerun, wf, runs_root=runs_root)
+    return rerun
 
 
 def execute_build_through_completion(
@@ -324,36 +410,125 @@ def execute_build_through_completion(
     permission_mode_cli: str | None,
     progress: ProgressHook,
     runs_root: Path,
+    build_create_pr: bool = False,
 ) -> tuple[RunState, int]:
     """Run build, build-review loop, and completion reporting; return final run state and exit code."""
-    if wf.stage == "build_review":
-        # Resuming after an interrupted review session; skip re-running the build.
-        build_permission = permission_mode_cli or execution.build_mode
-    else:
+    build_permission = permission_mode_cli or execution.build_mode
+    if wf.stage != "build_review":
         build_permission = permission_mode_cli or resolve_build_permission(execution.build_mode, session)
-        try:
-            run = run_build(
-                run,
-                router,
-                execution=execution,
-                permission_mode=build_permission,
-                progress=progress,
-                runs_root=runs_root,
-            )
-        except BuildFailedError as exc:
-            run = exc.run
-            wf.lifecycle_status = "failed"
-            save_workflow_state(run.run_dir, wf)
-            print(f"Build failed: {run.run_dir / '05-build-output.md'}")
-            print(f"Report: {run.run_dir / _REPORT_MARKDOWN_FILENAME}")
-            return run, 1
+        build_result = _run_build_stage(
+            run=run,
+            wf=wf,
+            router=router,
+            execution=execution,
+            build_permission=build_permission,
+            progress=progress,
+            runs_root=runs_root,
+        )
+        if isinstance(build_result, tuple):
+            return build_result
+        run = build_result
 
-        if can_transition(wf.stage, "build") and wf.stage != "build":
-            transition_stage(wf, "build")
-        if can_transition(wf.stage, "build_review") and wf.stage != "build_review":
-            transition_stage(wf, "build_review")
-        save_workflow_state(run.run_dir, wf)
+    review_code = _run_build_review_stage(
+        run=run,
+        wf=wf,
+        router=router,
+        execution=execution,
+        build_permission=build_permission,
+        session=session,
+        progress=progress,
+        runs_root=runs_root,
+    )
+    if review_code is not None:
+        return run, review_code
 
+    maybe_offer_github_pr(
+        workspace=router.workspace,
+        wf=wf,
+        task_id=run.run_id,
+        title_hint=run.prompt,
+        interactive_tty=not session.non_interactive,
+        create_pr_without_prompt=build_create_pr,
+    )
+    return _finish_build_completion(run=run, wf=wf, session=session)
+
+
+def _run_build_stage(
+    *,
+    run: RunState,
+    wf: WorkflowState,
+    router: ProviderRouter,
+    execution: ExecutionConfig,
+    build_permission: str,
+    progress: ProgressHook,
+    runs_root: Path,
+) -> RunState | tuple[RunState, int]:
+    try:
+        run = run_build(
+            run,
+            router,
+            execution=execution,
+            permission_mode=build_permission,
+            progress=progress,
+            runs_root=runs_root,
+        )
+    except BuildFailedError as exc:
+        return _handle_build_failure(exc, wf)
+    _mark_build_review_stage(run, wf)
+    checkpoint = _checkpoint_after_build(router.workspace, run, progress, runs_root=runs_root)
+    return checkpoint or run
+
+
+def _handle_build_failure(exc: BuildFailedError, wf: WorkflowState) -> tuple[RunState, int]:
+    run = exc.run
+    wf.lifecycle_status = "failed"
+    save_workflow_state(run.run_dir, wf)
+    print(f"Build failed: {run.run_dir / '05-build-output.md'}")
+    print(f"Report: {run.run_dir / _REPORT_MARKDOWN_FILENAME}")
+    return run, 1
+
+
+def _mark_build_review_stage(run: RunState, wf: WorkflowState) -> None:
+    if can_transition(wf.stage, "build") and wf.stage != "build":
+        transition_stage(wf, "build")
+    if can_transition(wf.stage, "build_review") and wf.stage != "build_review":
+        transition_stage(wf, "build_review")
+    save_workflow_state(run.run_dir, wf)
+
+
+def _checkpoint_after_build(
+    workspace: Path,
+    run: RunState,
+    progress: ProgressHook,
+    *,
+    runs_root: Path,
+) -> tuple[RunState, int] | None:
+    git_root = find_git_root(workspace)
+    if not git_root:
+        return None
+    paths = git_changed_pathspecs(git_root, excluded_roots=[runs_root])
+    if not paths:
+        return None
+    try:
+        _emit_local_progress(progress, run, "checkpointing implementation changes")
+        _checkpoint_build_milestones(workspace, git_root, run, paths, runs_root=runs_root)
+    except GitFlowError as exc:
+        print(f"Checkpoint commit failed: {exc}")
+        return run, 1
+    return None
+
+
+def _run_build_review_stage(
+    *,
+    run: RunState,
+    wf: WorkflowState,
+    router: ProviderRouter,
+    execution: ExecutionConfig,
+    build_permission: str,
+    session: InteractiveSession,
+    progress: ProgressHook,
+    runs_root: Path,
+) -> int | None:
     review_outcome = interactive_build_review_loop(
         session=session,
         run=run,
@@ -362,20 +537,27 @@ def execute_build_through_completion(
         permission_mode=build_permission,
         progress=progress,
         wf=wf,
+        runs_root=runs_root,
     )
-    if review_outcome == "cancel":
+    if review_outcome in {"cancel", "failed"}:
         print(f"Report: {run.run_dir / _REPORT_MARKDOWN_FILENAME}")
-        return run, 130
+        return 130 if review_outcome == "cancel" else 1
+    return None
 
+
+def _finish_build_completion(
+    *,
+    run: RunState,
+    wf: WorkflowState,
+    session: InteractiveSession,
+) -> tuple[RunState, int]:
     completion = finalize_completion_reports(session=session, run=run, wf=wf)
     if completion == "cancel":
         print(f"Report: {run.run_dir / _REPORT_MARKDOWN_FILENAME}")
         return run, 130
-
     if can_transition(wf.stage, "complete"):
         transition_stage(wf, "complete")
         save_workflow_state(run.run_dir, wf)
-
     print(f"Build output: {run.run_dir / '05-build-output.md'}")
     print(f"Review summary: {run.run_dir / '08-build-review-summary.md'}")
     print(f"Report: {run.run_dir / _REPORT_MARKDOWN_FILENAME}")
@@ -440,7 +622,7 @@ def _write_apply_follow_up_notes(
     run: RunState,
     recommendations: list[BuildRecommendation],
     expanded: list[str],
-) -> None:
+) -> str:
     by_id = {rec.id: rec for rec in recommendations}
     instructions = "\n".join(
         f"- {by_id[rec_id].title}: {by_id[rec_id].description}" for rec_id in expanded if rec_id in by_id
@@ -449,6 +631,70 @@ def _write_apply_follow_up_notes(
     write_text(run, "10-build-follow-up.md", note)
     write_text(run, _REPORT_MARKDOWN_FILENAME, render_report(run))
     write_state(run)
+    return instructions
+
+
+def _checkpoint_review_fixes(
+    workspace: Path, run: RunState, wf: WorkflowState, *, runs_root: Path | None = None
+) -> None:
+    git_root = find_git_root(workspace)
+    if not git_root:
+        return
+    excluded = [runs_root] if runs_root else None
+    paths = git_changed_pathspecs(git_root, excluded_roots=excluded)
+    if not paths:
+        return
+    ctx = ContextStore(workspace)
+    ctx.init()
+    commit_checkpoint(
+        git_root,
+        "review-fixes-complete",
+        "applied build review recommendations",
+        paths,
+        record_context=ctx,
+        task_id=wf.task_id or run.run_id,
+        excluded_roots=excluded,
+    )
+
+
+def _checkpoint_build_milestones(
+    workspace: Path,
+    git_root: Path,
+    run: RunState,
+    paths: list[str],
+    *,
+    runs_root: Path | None = None,
+) -> None:
+    ctx = ContextStore(workspace)
+    ctx.init()
+    has_tests = any(_looks_like_test_path(path) for path in paths)
+    commit_checkpoint(
+        git_root,
+        "implementation-complete",
+        "post-build workspace changes",
+        paths,
+        record_context=ctx,
+        task_id=run.run_id,
+        excluded_roots=[runs_root] if runs_root else None,
+    )
+    if has_tests:
+        ctx.add_context_item(
+            task_id=run.run_id,
+            kind="checkpoint",
+            path=None,
+            content="tests-added-or-updated\n",
+            metadata={"label": "tests-added-or-updated", "paths": [p for p in paths if _looks_like_test_path(p)]},
+        )
+
+
+def _looks_like_test_path(path: str) -> bool:
+    normalized = path.replace("\\", "/").lower()
+    return normalized.startswith("tests/") or "/tests/" in normalized or normalized.startswith("test_")
+
+
+def _emit_local_progress(progress: ProgressHook, run: RunState, message: str) -> None:
+    run._last_local_progress = message  # type: ignore[attr-defined]
+    progress("local", "workflow", run, None, None, None)
 
 
 def _format_terminal_report(markdown: str) -> str:

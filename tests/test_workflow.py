@@ -1,15 +1,30 @@
+from pathlib import Path
+
 import pytest
 
 from llm_plan_execute.build_review_schema import BuildRecommendation
 from llm_plan_execute.config import ExecutionConfig
 from llm_plan_execute.providers import DryRunProvider, Provider, ProviderRouter
-from llm_plan_execute.types import ExecutionPolicy, ModelAssignment, ModelInfo, ProviderResult, RunState, Usage
+from llm_plan_execute.types import (
+    Clarification,
+    ExecutionPolicy,
+    ModelAssignment,
+    ModelInfo,
+    ProviderActivity,
+    ProviderResult,
+    RunState,
+    Usage,
+)
 from llm_plan_execute.workflow import (
     BuildFailedError,
+    _git_exclude_pathspecs,
     _run_provider,
     accept_plan,
+    apply_build_recommendation_fixes,
     complete_planning,
+    parse_clarification,
     record_build_recommendation_application,
+    render_clarification,
     rerun_build_review,
     run_build,
     run_clarification,
@@ -247,6 +262,122 @@ def test_rerun_build_review_writes_review_artifacts(tmp_path):
     ]
 
 
+def test_apply_build_recommendation_fixes_requires_accepted_plan_and_build(tmp_path: Path) -> None:
+    router = ProviderRouter([DryRunProvider()], workspace=tmp_path)
+    run = RunState.create("prompt", tmp_path / "runs")
+    run.run_dir.mkdir(parents=True)
+    run.build_output = "out"
+    with pytest.raises(ValueError, match="accepted plan"):
+        apply_build_recommendation_fixes(run, router, "do it")
+
+    run.accepted_plan = "plan"
+    run.build_output = ""
+    with pytest.raises(ValueError, match="build output"):
+        apply_build_recommendation_fixes(run, router, "do it")
+
+
+def test_apply_build_recommendation_fixes_success_then_reruns_review(monkeypatch, tmp_path: Path) -> None:
+    router = ProviderRouter([RecordingBuildProvider()], workspace=tmp_path)
+    run = _accepted_build_run(tmp_path)
+    run.build_output = "prior builder output"
+    diff_sequence = iter(["before-diff", "after-diff"])
+    monkeypatch.setattr(
+        "llm_plan_execute.workflow._workspace_changes",
+        lambda *_a, **_kw: next(diff_sequence),
+    )
+    monkeypatch.setattr(
+        "llm_plan_execute.workflow.rerun_build_review",
+        lambda existing, _router, **_kw: existing,
+    )
+
+    out = apply_build_recommendation_fixes(run, router, "Fix lint in src/app.py.")
+
+    assert out is run
+    assert (run.run_dir / "11-build-review-fix-output.md").read_text(encoding="utf-8").strip() == "builder output"
+    assert run.build_status == "succeeded"
+
+
+def test_apply_build_recommendation_fixes_raises_when_workspace_unchanged(monkeypatch, tmp_path: Path) -> None:
+    router = ProviderRouter([RecordingBuildProvider()], workspace=tmp_path)
+    run = _accepted_build_run(tmp_path)
+    run.build_output = "prior"
+    monkeypatch.setattr("llm_plan_execute.workflow._workspace_changes", lambda *_a, **_kw: "same-diff")
+
+    with pytest.raises(BuildFailedError, match="without changing the workspace"):
+        apply_build_recommendation_fixes(run, router, "Fix something")
+
+
+def test_parse_and_render_clarification_round_trip() -> None:
+    raw = """Status: clear
+
+Questions:
+- What scope?
+
+Assumptions:
+- none
+
+Ignore this paragraph without a bullet marker.
+- """
+
+    clar = parse_clarification(raw)
+    assert clar.questions == ["What scope?"]
+    assert clar.assumptions == []
+    rendered = render_clarification(
+        Clarification(status="clear", questions=[], answers=[], assumptions=[], raw_output="x")
+    )
+    assert "- none" in rendered
+    assert "## Raw Output" in rendered
+
+
+def test_parse_clarification_needs_questions_status() -> None:
+    clar = parse_clarification("Status: needs questions\n")
+    assert clar.status == "needs_questions"
+
+
+def test_git_exclude_pathspecs_workspace_relative(tmp_path: Path) -> None:
+    assert _git_exclude_pathspecs(tmp_path, None) == []
+    assert _git_exclude_pathspecs(tmp_path, Path("/nonexistent/outside")) == []
+    assert _git_exclude_pathspecs(tmp_path, tmp_path) == []
+    sub = tmp_path / "runs"
+    sub.mkdir()
+    specs = _git_exclude_pathspecs(tmp_path, sub)
+    assert specs == [":(exclude)runs"]
+
+
+def test_run_provider_emits_activity_events(tmp_path: Path) -> None:
+    model = ModelInfo("local", "builder", ("builder",))
+
+    class ActivityProvider(Provider):
+        def available_models(self) -> list[ModelInfo]:
+            return [model]
+
+        def run(
+            self,
+            role: str,
+            model: ModelInfo,
+            prompt: str,
+            _execution_policy: ExecutionPolicy | None = None,
+            activity=None,
+        ) -> ProviderResult:
+            if activity is not None:
+                activity(ProviderActivity(role=role, model=model, kind="file", message="read"))
+            return ProviderResult(role, model, prompt, "done", Usage(), 0.0, None)
+
+    router = ProviderRouter([ActivityProvider()], workspace=tmp_path)
+    run = RunState.create("prompt", tmp_path)
+    stages: list[str] = []
+
+    def progress(stage: str, *_rest: object) -> None:
+        stages.append(stage)
+
+    _run_provider(run, router, "builder", model, "prompt", ExecutionPolicy(), progress)
+
+    assert "start" in stages
+    assert "activity" in stages
+    assert "finish" in stages
+    assert run._last_provider_activity.message == "read"  # type: ignore[attr-defined]
+
+
 def test_record_build_recommendation_application_writes_selected_items(tmp_path):
     run = RunState.create("prompt", tmp_path / "runs")
     run.run_dir.mkdir(parents=True)
@@ -296,6 +427,7 @@ class RecordingBuildProvider(Provider):
         model: ModelInfo,
         prompt: str,
         execution_policy: ExecutionPolicy | None = None,
+        _activity: object = None,
     ) -> ProviderResult:
         self.calls.append(role)
         if execution_policy:
@@ -318,5 +450,6 @@ class WarningProvider(Provider):
         model: ModelInfo,
         prompt: str,
         _execution_policy: ExecutionPolicy | None = None,
+        _activity: object = None,
     ) -> ProviderResult:
         return ProviderResult(role, model, prompt, "ok", Usage(), 0.0, warning="warning text")

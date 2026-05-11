@@ -10,7 +10,13 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "llm-plan-execute contributors" }]
-dependencies = []
+dependencies = [
+    "filelock>=3.29.0",
+    "rich>=15.0.0",
+]
+
+[project.optional-dependencies]
+fastembed = ["fastembed"]
 
 [project.scripts]
 llm-plan-execute = "llm_plan_execute.cli:main"

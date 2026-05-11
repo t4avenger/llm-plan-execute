@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import selectors
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from .config import AppConfig, ProviderConfig
-from .types import ExecutionPolicy, ModelInfo, ProviderResult, Usage
+from .types import ExecutionPolicy, ModelInfo, ProviderActivity, ProviderResult, Usage
+
+ActivityCallback = Callable[[ProviderActivity], None]
 
 
 def estimate_tokens(text: str) -> int:
@@ -31,6 +35,7 @@ class Provider:
         model: ModelInfo,
         prompt: str,
         _execution_policy: ExecutionPolicy | None = None,
+        _activity: ActivityCallback | None = None,
     ) -> ProviderResult:
         raise NotImplementedError
 
@@ -61,6 +66,7 @@ class DryRunProvider(Provider):
         model: ModelInfo,
         prompt: str,
         _execution_policy: ExecutionPolicy | None = None,
+        _activity: ActivityCallback | None = None,
     ) -> ProviderResult:
         start = time.monotonic()
         output = dry_response(role, prompt)
@@ -195,6 +201,7 @@ class CLIProvider(Provider):
         model: ModelInfo,
         prompt: str,
         execution_policy: ExecutionPolicy | None = None,
+        activity: ActivityCallback | None = None,
     ) -> ProviderResult:
         start = time.monotonic()
         usage = Usage(input_tokens=estimate_tokens(prompt), exact=False, confidence="estimated")
@@ -216,7 +223,13 @@ class CLIProvider(Provider):
         policy = execution_policy or ExecutionPolicy()
         provider_command = adapter.build_command(self.config, model, prompt, self.workspace, policy)
         try:
-            completed, warning = self._run_command_with_cursor_sandbox_fallback(provider_command)
+            completed, warning = self._run_command_with_cursor_sandbox_fallback(
+                provider_command,
+                role=role,
+                model=model,
+                activity=activity,
+                start=start,
+            )
             output, error = _provider_output_and_error(completed)
             usage.output_tokens = estimate_tokens(output)
             usage.cost_usd = estimate_cost(model, usage)
@@ -230,13 +243,32 @@ class CLIProvider(Provider):
     def _run_command_with_cursor_sandbox_fallback(
         self,
         provider_command: ProviderCommand,
+        *,
+        role: str,
+        model: ModelInfo,
+        activity: ActivityCallback | None,
+        start: float,
     ) -> tuple[subprocess.CompletedProcess[str], str | None]:
-        completed = _run_provider_command(provider_command)
+        completed = _run_provider_command(
+            provider_command,
+            provider_name=self.config.name,
+            role=role,
+            model=model,
+            activity=activity,
+            start=start,
+        )
         if not _should_retry_cursor_without_sandbox(self.config.name, provider_command.args, completed):
             return completed, None
 
         retry_command = ProviderCommand(_without_cursor_sandbox_args(provider_command.args), provider_command.cwd)
-        retry = _run_provider_command(retry_command)
+        retry = _run_provider_command(
+            retry_command,
+            provider_name=self.config.name,
+            role=role,
+            model=model,
+            activity=activity,
+            start=start,
+        )
         if retry.returncode == 0 or retry.stdout.strip():
             return retry, CURSOR_SANDBOX_RETRY_WARNING
         return completed, None
@@ -268,10 +300,16 @@ class ProviderRouter:
         model: ModelInfo,
         prompt: str,
         execution_policy: ExecutionPolicy | None = None,
+        activity: ActivityCallback | None = None,
     ) -> ProviderResult:
         for provider in self.providers:
             if any(candidate.id == model.id for candidate in provider.available_models()):
-                return provider.run(role, model, prompt, execution_policy)
+                if activity is None:
+                    return provider.run(role, model, prompt, execution_policy)
+                try:
+                    return provider.run(role, model, prompt, execution_policy, activity)
+                except TypeError:
+                    return provider.run(role, model, prompt, execution_policy)
         raise ValueError(f"No provider can run selected model {model.id}")
 
 
@@ -292,7 +330,24 @@ def _cursor_permission_args(policy: ExecutionPolicy) -> list[str]:
     return []
 
 
-def _run_provider_command(provider_command: ProviderCommand) -> subprocess.CompletedProcess[str]:
+def _run_provider_command(
+    provider_command: ProviderCommand,
+    *,
+    provider_name: str = "",
+    role: str | None = None,
+    model: ModelInfo | None = None,
+    activity: ActivityCallback | None = None,
+    start: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    if activity is not None and role is not None and model is not None:
+        return _run_provider_command_streaming(
+            provider_command,
+            provider_name=provider_name,
+            role=role,
+            model=model,
+            activity=activity,
+            start=start or time.monotonic(),
+        )
     # Provider command is explicit user config, never a shell.
     return subprocess.run(  # noqa: S603
         provider_command.args,
@@ -302,6 +357,263 @@ def _run_provider_command(provider_command: ProviderCommand) -> subprocess.Compl
         check=False,
         timeout=PROVIDER_RUN_TIMEOUT_SEC,
     )
+
+
+def _run_provider_command_streaming(
+    provider_command: ProviderCommand,
+    *,
+    provider_name: str,
+    role: str,
+    model: ModelInfo,
+    activity: ActivityCallback,
+    start: float,
+) -> subprocess.CompletedProcess[str]:
+    args = _streaming_args(provider_name, provider_command.args)
+    proc = subprocess.Popen(  # noqa: S603
+        args,
+        cwd=provider_command.cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout, stderr = _collect_streaming_output(
+        proc,
+        args=args,
+        provider_name=provider_name,
+        role=role,
+        model=model,
+        activity=activity,
+        start=start,
+        workspace=provider_command.cwd,
+    )
+    return subprocess.CompletedProcess(
+        args,
+        proc.returncode if proc.returncode is not None else 0,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+def _collect_streaming_output(
+    proc: subprocess.Popen[str],
+    *,
+    args: list[str],
+    provider_name: str,
+    role: str,
+    model: ModelInfo,
+    activity: ActivityCallback,
+    start: float,
+    workspace: Path,
+) -> tuple[str, str]:
+    timeout_at = start + PROVIDER_RUN_TIMEOUT_SEC
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    if proc.stdout is None or proc.stderr is None:
+        raise subprocess.SubprocessError("provider stdout/stderr pipes were not available")
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(proc.stderr, selectors.EVENT_READ, "stderr")
+    try:
+        while selector.get_map():
+            if time.monotonic() > timeout_at:
+                proc.kill()
+                proc.communicate()
+                raise subprocess.TimeoutExpired(args, PROVIDER_RUN_TIMEOUT_SEC)
+            for key, _mask in selector.select(timeout=0.2):
+                _handle_stream_line(
+                    key,
+                    selector=selector,
+                    stdout_lines=stdout_lines,
+                    stderr_lines=stderr_lines,
+                    provider_name=provider_name,
+                    role=role,
+                    model=model,
+                    activity=activity,
+                    start=start,
+                    workspace=workspace,
+                )
+        proc.wait(timeout=0)
+    finally:
+        selector.close()
+    return "".join(stdout_lines), "".join(stderr_lines)
+
+
+def _handle_stream_line(
+    key: selectors.SelectorKey,
+    *,
+    selector: selectors.BaseSelector,
+    stdout_lines: list[str],
+    stderr_lines: list[str],
+    provider_name: str,
+    role: str,
+    model: ModelInfo,
+    activity: ActivityCallback,
+    start: float,
+    workspace: Path,
+) -> None:
+    line = key.fileobj.readline()
+    if line == "":
+        selector.unregister(key.fileobj)
+        return
+    if key.data == "stderr":
+        stderr_lines.append(line)
+        return
+    stdout_lines.append(line)
+    parsed = _activity_from_stream_line(
+        provider_name,
+        line,
+        role=role,
+        model=model,
+        elapsed=time.monotonic() - start,
+        workspace=workspace,
+    )
+    if parsed is not None:
+        activity(parsed)
+
+
+def _streaming_args(provider_name: str, args: list[str]) -> list[str]:
+    if provider_name == "codex" and "--json" not in args:
+        return [*args[:-1], "--json", args[-1]] if args else args
+    if provider_name == "cursor":
+        return _cursor_streaming_args(args)
+    if provider_name == "claude":
+        return _claude_streaming_args(args)
+    return args
+
+
+def _cursor_streaming_args(args: list[str]) -> list[str]:
+    updated = list(args)
+    if "--output-format" in updated:
+        index = updated.index("--output-format")
+        if index + 1 < len(updated):
+            updated[index + 1] = "stream-json"
+    else:
+        updated[1:1] = ["--output-format", "stream-json"]
+    if "--stream-partial-output" not in updated:
+        prompt = updated.pop() if updated else ""
+        updated.extend(["--stream-partial-output", prompt])
+    return updated
+
+
+def _claude_streaming_args(args: list[str]) -> list[str]:
+    updated = list(args)
+    if "--print" not in updated and "-p" not in updated:
+        updated.insert(1, "--print")
+    if "--output-format" not in updated:
+        updated[1:1] = ["--output-format", "stream-json"]
+    for flag in ("--include-partial-messages", "--include-hook-events"):
+        if flag not in updated:
+            updated.insert(1, flag)
+    return updated
+
+
+def _activity_from_stream_line(
+    provider_name: str,
+    line: str,
+    *,
+    role: str,
+    model: ModelInfo,
+    elapsed: float,
+    workspace: Path,
+) -> ProviderActivity | None:
+    text = line.strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return ProviderActivity(role, model, "message", _compact_text(text), elapsed_seconds=elapsed)
+    return _activity_from_json_payload(
+        provider_name,
+        payload,
+        role=role,
+        model=model,
+        elapsed=elapsed,
+        workspace=workspace,
+    )
+
+
+def _activity_from_json_payload(
+    provider_name: str,
+    payload: object,
+    *,
+    role: str,
+    model: ModelInfo,
+    elapsed: float,
+    workspace: Path,
+) -> ProviderActivity | None:
+    if not isinstance(payload, dict):
+        return None
+    flat = json.dumps(payload, sort_keys=True)
+    tool_name = _first_string(payload, ("tool_name", "tool", "name"))
+    command = _first_string(payload, ("command", "cmd"))
+    path = _extract_workspace_path(payload, workspace)
+    message = _first_string(payload, ("message", "text", "delta", "content", "summary"))
+    kind = str(payload.get("type") or payload.get("event") or payload.get("kind") or "activity")
+    if path:
+        action = _file_action_from_payload(flat)
+        message = f"{action} {path}"
+    elif command:
+        message = f"running {command}"
+    elif tool_name:
+        message = f"using {tool_name}"
+    elif message:
+        message = _compact_text(message)
+    else:
+        provider_label = provider_name or model.provider
+        message = f"{provider_label} reported {kind}"
+    return ProviderActivity(
+        role,
+        model,
+        kind,
+        message,
+        tool_name=tool_name,
+        workspace_path=path,
+        command=command,
+        elapsed_seconds=elapsed,
+    )
+
+
+def _first_string(payload: dict[str, object], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for value in payload.values():
+        if isinstance(value, dict):
+            found = _first_string(value, keys)
+            if found:
+                return found
+    return None
+
+
+def _extract_workspace_path(payload: dict[str, object], workspace: Path) -> str | None:
+    raw = _first_string(payload, ("path", "file", "file_path", "filepath", "uri"))
+    if not raw:
+        return None
+    raw = raw.removeprefix("file://")
+    candidate = Path(raw)
+    try:
+        resolved = candidate.resolve() if candidate.is_absolute() else (workspace / candidate).resolve()
+        return resolved.relative_to(workspace.resolve()).as_posix()
+    except (OSError, ValueError):
+        return raw
+
+
+def _file_action_from_payload(flat_payload: str) -> str:
+    lower = flat_payload.lower()
+    if any(token in lower for token in ("edit", "write", "patch", "update", "create")):
+        return "editing"
+    if any(token in lower for token in ("read", "open", "view")):
+        return "reading"
+    return "touching"
+
+
+def _compact_text(text: str, *, max_len: int = 160) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= max_len:
+        return compact
+    return compact[: max_len - 1].rstrip() + "..."
 
 
 def _provider_output_and_error(completed: subprocess.CompletedProcess[str]) -> tuple[str, str | None]:

@@ -10,6 +10,7 @@ from .types import PERMISSION_MODES, ROLES, ExecutionPolicy, ModelInfo
 
 DEFAULT_ROOT = Path(".llm-plan-execute")
 DEFAULT_CONFIG = DEFAULT_ROOT / "config.json"
+_MSG_JSON_VALUE_MUST_BE_OBJECT = "must be an object"
 SUPPORTED_PROVIDERS = frozenset({"codex", "cursor", "claude"})
 SCORE_FIELDS = ("reasoning", "speed", "cost", "context")
 MIN_SCORE = 1
@@ -47,12 +48,21 @@ class ExecutionConfig:
 
 
 @dataclass(frozen=True)
+class BuildConfig:
+    """Git/build orchestration defaults (see docs)."""
+
+    base_branch: str | None = None
+    create_pr: bool = False
+
+
+@dataclass(frozen=True)
 class AppConfig:
     providers: tuple[ProviderConfig, ...]
     runs_dir: Path = DEFAULT_ROOT / "runs"
     dry_run: bool = False
     workspace: Path = Path(".")
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    build: BuildConfig = field(default_factory=BuildConfig)
 
 
 @dataclass(frozen=True)
@@ -89,6 +99,7 @@ def sample_config() -> dict[str, Any]:
             },
             "writable_dirs": [],
         },
+        "build": {"base_branch": None, "create_pr": False},
         "providers": [
             {
                 "name": "codex",
@@ -279,6 +290,7 @@ def parse_config(raw: dict[str, Any], *, workspace: Path, dry_run: bool = False)
 
     runs_dir = normalize_runs_dir(workspace, Path(raw.get("runs_dir", ".llm-plan-execute/runs")))
     execution = _parse_execution(raw.get("execution", {}), workspace)
+    build = _parse_build(raw.get("build", {}))
 
     return AppConfig(
         providers=tuple(providers),
@@ -286,7 +298,18 @@ def parse_config(raw: dict[str, Any], *, workspace: Path, dry_run: bool = False)
         dry_run=bool(raw.get("dry_run", False) or dry_run),
         workspace=workspace,
         execution=execution,
+        build=build,
     )
+
+
+def _parse_build(raw: object) -> BuildConfig:
+    if raw in ({}, None):
+        return BuildConfig()
+    if not isinstance(raw, dict):
+        return BuildConfig()
+    bb = raw.get("base_branch")
+    base_branch = bb if isinstance(bb, str) and bb.strip() else None
+    return BuildConfig(base_branch=base_branch, create_pr=bool(raw.get("create_pr", False)))
 
 
 def _parse_execution(raw: object, workspace: Path) -> ExecutionConfig:
@@ -350,6 +373,7 @@ def validate_config_data(raw: object, *, require_providers: bool | None = None) 
 
     _validate_root_fields(raw, errors)
     _validate_execution(raw.get("execution", {}), errors)
+    _validate_build(raw.get("build"), errors)
 
     providers = raw.get("providers")
     if providers is None and not require_providers:
@@ -379,7 +403,7 @@ def _validate_execution(raw: object, errors: list[ConfigIssue]) -> None:
     if raw in ({}, None):
         return
     if not isinstance(raw, dict):
-        errors.append(ConfigIssue("error", "execution", "must be an object"))
+        errors.append(ConfigIssue("error", "execution", _MSG_JSON_VALUE_MUST_BE_OBJECT))
         return
     _validate_permission_mode("execution.default_mode", raw.get("default_mode", "workspace-write"), errors)
     _validate_execution_phases(raw.get("phases", {}), errors)
@@ -388,11 +412,23 @@ def _validate_execution(raw: object, errors: list[ConfigIssue]) -> None:
 
 def _validate_execution_phases(phases: object, errors: list[ConfigIssue]) -> None:
     if not isinstance(phases, dict):
-        errors.append(ConfigIssue("error", "execution.phases", "must be an object"))
+        errors.append(ConfigIssue("error", "execution.phases", _MSG_JSON_VALUE_MUST_BE_OBJECT))
         return
     for phase in ("planning", "review", "build"):
         if phase in phases:
             _validate_permission_mode(f"execution.phases.{phase}", phases[phase], errors)
+
+
+def _validate_build(raw: object, errors: list[ConfigIssue]) -> None:
+    if raw in (None, {}):
+        return
+    if not isinstance(raw, dict):
+        errors.append(ConfigIssue("error", "build", _MSG_JSON_VALUE_MUST_BE_OBJECT))
+        return
+    if "base_branch" in raw and raw["base_branch"] is not None and not isinstance(raw["base_branch"], str):
+        errors.append(ConfigIssue("error", "build.base_branch", "must be a string or null"))
+    if "create_pr" in raw and not isinstance(raw["create_pr"], bool):
+        errors.append(ConfigIssue("error", "build.create_pr", "must be a boolean"))
 
 
 def _validate_writable_dirs(writable_dirs: object, errors: list[ConfigIssue]) -> None:

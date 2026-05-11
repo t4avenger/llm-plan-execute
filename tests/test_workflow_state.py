@@ -19,6 +19,27 @@ from llm_plan_execute.workflow_state import (
 )
 
 
+def test_workflow_state_v2_missing_fields_default_none(tmp_path):
+    """Schema v2 files deserialize new v3-only fields as ``None``."""
+    legacy_schema_v2 = 2
+    legacy = {
+        "schema_version": legacy_schema_v2,
+        "stage": "plan_review",
+        "lifecycle_status": "active",
+    }
+    path = tmp_path / "workflow-state.json"
+    path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+    loaded = load_workflow_state(tmp_path)
+    assert loaded.schema_version == legacy_schema_v2
+    assert loaded.task_id is None
+    assert loaded.branch is None
+    assert loaded.base_branch is None
+    assert loaded.context_db_path is None
+    save_workflow_state(tmp_path, loaded)
+    upgraded = load_workflow_state(tmp_path)
+    assert upgraded.schema_version == CURRENT_WORKFLOW_SCHEMA_VERSION
+
+
 def test_terminal_report_printed_requires_literal_true():
     assert WorkflowState.from_json_dict({"terminal_report_printed": True}).terminal_report_printed is True
     assert WorkflowState.from_json_dict({"terminal_report_printed": False}).terminal_report_printed is False

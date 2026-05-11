@@ -1,0 +1,47 @@
+name: Release bump
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_part:
+        description: Version segment to bump
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      prerelease:
+        description: Optional prerelease suffix, for example rc.1
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+      - name: Bump version
+        id: bump
+        run: |
+          if [ -n "${{ inputs.prerelease }}" ]; then
+            version="$(python scripts/bump_version.py "${{ inputs.version_part }}" --prerelease "${{ inputs.prerelease }}")"
+          else
+            version="$(python scripts/bump_version.py "${{ inputs.version_part }}")"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      - name: Open release bump PR
+        uses: peter-evans/create-pull-request@8d3c55c884e9db2d8801a04e9e4c68f910e02299 # v6.1.0
+        with:
+          branch: release/bump-${{ steps.bump.outputs.version }}
+          title: "Release ${{ steps.bump.outputs.version }}"
+          commit-message: "Bump version to ${{ steps.bump.outputs.version }}"
+          body: "Automated release version bump."
