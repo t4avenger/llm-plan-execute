@@ -4,6 +4,7 @@ from pathlib import Path
 from llm_plan_execute.config import ProviderConfig
 from llm_plan_execute.providers import (
     CURSOR_SANDBOX_RETRY_WARNING,
+    PROVIDER_RUN_TIMEOUT_SEC,
     ClaudeAdapter,
     CLIProvider,
     CodexAdapter,
@@ -12,9 +13,6 @@ from llm_plan_execute.providers import (
     ProviderRouter,
 )
 from llm_plan_execute.types import ExecutionPolicy, ModelInfo, ProviderResult, Usage
-
-# Mirrors llm_plan_execute.providers._run_provider_command timeout=...
-_PROVIDER_RUN_TIMEOUT_SEC = 1800
 
 
 def test_cli_provider_captures_nonzero_exit_code(monkeypatch):
@@ -209,7 +207,7 @@ def test_claude_provider_invokes_subprocess_with_documented_contract(monkeypatch
     assert captured["cmd"] == ["claude", "--model", "opus", "review this plan"]
     kwargs = captured["kwargs"]
     assert kwargs["cwd"] == tmp_path.resolve()
-    assert kwargs["timeout"] == _PROVIDER_RUN_TIMEOUT_SEC
+    assert kwargs["timeout"] == PROVIDER_RUN_TIMEOUT_SEC
     assert kwargs["text"] is True
     assert kwargs["capture_output"] is True
     assert kwargs["check"] is False
@@ -255,7 +253,9 @@ def test_claude_provider_reports_unresolved_command(monkeypatch):
 
     result = provider.run("builder", model, "prompt")
 
-    assert result.error == "Provider command 'claude' could not be resolved."
+    assert result.error == (
+        "Provider command 'claude' could not be resolved via PATH lookup or as a configured executable path."
+    )
     assert result.output == result.error
 
 
@@ -267,7 +267,9 @@ def test_cli_provider_reports_missing_command(monkeypatch):
 
     result = provider.run("planner", model, "prompt")
 
-    assert result.error == "Provider command 'missing-codex' could not be resolved."
+    assert result.error == (
+        "Provider command 'missing-codex' could not be resolved via PATH lookup or as a configured executable path."
+    )
     assert result.output == result.error
 
 

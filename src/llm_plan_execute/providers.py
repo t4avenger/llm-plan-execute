@@ -97,6 +97,7 @@ CURSOR_SANDBOX_RETRY_WARNING = (
     "Cursor sandbox was unavailable on this system; retried without Cursor sandbox flags. "
     "Cursor may run in allowlist or approval mode instead."
 )
+PROVIDER_RUN_TIMEOUT_SEC = 1800
 
 
 class CodexAdapter(ProviderAdapter):
@@ -204,7 +205,10 @@ class CLIProvider(Provider):
             usage.cost_usd = estimate_cost(model, usage)
             return ProviderResult(role, model, prompt, output, usage, time.monotonic() - start, output)
         if shutil.which(self.config.command) is None:
-            error = f"Provider command {self.config.command!r} could not be resolved."
+            error = (
+                f"Provider command {self.config.command!r} could not be resolved via PATH lookup "
+                "or as a configured executable path."
+            )
             usage.output_tokens = estimate_tokens(error)
             usage.cost_usd = estimate_cost(model, usage)
             return ProviderResult(role, model, prompt, error, usage, time.monotonic() - start, error)
@@ -296,7 +300,7 @@ def _run_provider_command(provider_command: ProviderCommand) -> subprocess.Compl
         text=True,
         capture_output=True,
         check=False,
-        timeout=1800,
+        timeout=PROVIDER_RUN_TIMEOUT_SEC,
     )
 
 

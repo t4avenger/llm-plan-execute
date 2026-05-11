@@ -59,7 +59,7 @@ The CLI separates **installed application code** from the **workspace** you are 
 Run artifacts under the configured `runs_dir` are excluded from git-based workspace change detection so generated files do not look like user edits.
 
 Provider configs live at `.llm-plan-execute/config.json` (relative to the chosen workspace) and are intentionally local.
-`init-config` enables provider entries whose configured command is found on `PATH` and disables missing commands. For example, a machine with `codex` and `cursor-agent` installed will enable Codex and Cursor, while leaving Claude disabled if `claude` is absent. Cursor's default model is builder-only unless you explicitly add planning or review roles.
+`init-config` writes default model entries for Codex, Claude, and Cursor, then enables only provider entries whose configured command is found on `PATH`. For example, a machine with `codex` and `cursor-agent` installed will enable Codex and Cursor, while leaving Claude disabled if `claude` is absent. Cursor's default model is builder-only unless you explicitly add planning or review roles.
 
 Normal CLI usage requires a config file. If `.llm-plan-execute/config.json` is missing, commands such as `models`, `run`, `plan`, and `build` fail with guidance to run `init-config`, pass `--config`, or opt into `--dry-run`.
 
@@ -118,7 +118,26 @@ The real-provider path uses explicit adapters for each supported CLI:
       "name": "claude",
       "command": "claude",
       "enabled": false,
-      "models": []
+      "models": [
+        {
+          "name": "opus",
+          "roles": ["plan_reviewer_b", "build_reviewer_b"],
+          "reasoning": 5,
+          "speed": 3,
+          "cost": 5,
+          "context": 5,
+          "exact_usage": false
+        },
+        {
+          "name": "sonnet",
+          "roles": ["builder", "plan_reviewer_a", "build_reviewer_a"],
+          "reasoning": 4,
+          "speed": 4,
+          "cost": 3,
+          "context": 5,
+          "exact_usage": false
+        }
+      ]
     }
   ]
 }
@@ -150,7 +169,7 @@ uv run llm-plan-execute models
 uv run llm-plan-execute plan --prompt "Smoke test Claude provider startup" --permission-mode read-only
 ```
 
-Before the final `plan` command, edit `.llm-plan-execute/config.json` so the Claude provider is enabled, has at least one model, and that model is eligible for the role you want to exercise. The smoke succeeds when the run report shows a Claude model assignment and either provider output or a Claude-auth/runtime error from the spawned CLI.
+Before the final `plan` command, edit `.llm-plan-execute/config.json` only if `init-config` disabled Claude or if you want to change the default Claude model names or role eligibility. The smoke succeeds when the run report shows a Claude model assignment and either provider output or a Claude-auth/runtime error from the spawned CLI.
 
 Execution permissions are passed to provider CLIs for every model call. By default, planning and review calls use `read-only`, while the builder uses `workspace-write`. Override a command with `--permission-mode read-only|workspace-write|full-access`, and add extra writable locations with repeated `--writable-dir <path>`.
 
