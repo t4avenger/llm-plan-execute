@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from rich.console import Console
+
 from .artifacts import load_state
 from .config import (
     DEFAULT_CONFIG,
@@ -21,6 +23,9 @@ from .config import (
     validate_config_file,
     write_sample_config,
 )
+from .context_cli import register_context_parser, run_context_command
+from .git_flow import GitFlowError
+from .implementation_hooks import prepare_implementation_entry
 from .interactive import InteractiveCanceledError, InteractiveSession
 from .providers import ProviderRouter
 from .reporting import render_report
@@ -67,6 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quiet", action="store_true", help="Suppress progress output.")
     parser.add_argument("--verbose", action="store_true", help="Show provider error details in progress output.")
     parser.add_argument(
+        "--ui",
+        choices=("auto", "rich", "plain", "jsonl"),
+        default="auto",
+        help="Progress renderer for provider activity (default: auto).",
+    )
+    parser.add_argument(
         "--non-interactive",
         "--ci",
         action="store_true",
@@ -103,6 +114,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     accept = sub.add_parser("accept", help="Accept a reviewed proposed plan.")
     accept.add_argument("--run-dir", type=Path, required=True)
+    accept.add_argument("--build", action="store_true", help="Continue into build after accepting the plan.")
+    accept.add_argument("--no-build", action="store_true", help="Do not prompt to build after accepting the plan.")
+    _add_permission_args(accept)
 
     build = sub.add_parser(
         "build",
@@ -123,6 +137,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     report = sub.add_parser("report", help="Render a report for a run.")
     report.add_argument("--run-dir", type=Path, required=True)
+
+    register_context_parser(sub)
     return parser
 
 
@@ -135,6 +151,9 @@ def main(argv: list[str] | None = None) -> int:
     except InteractiveCanceledError:
         print("Workflow canceled.", file=sys.stderr)
         return 130
+    except GitFlowError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     except (KeyError, OSError, TypeError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
@@ -150,9 +169,12 @@ def _run(argv: list[str] | None = None) -> int:
     if args.command == "config":
         return _cmd_config(args, workspace)
 
+    if args.command == "context":
+        return run_context_command(args, workspace)
+
     app_config = load_config(args.config, workspace=workspace, dry_run=args.dry_run)
     router = ProviderRouter.from_config(app_config)
-    progress = ProgressReporter(enabled=not args.quiet, verbose=args.verbose, stream=sys.stderr)
+    progress = ProgressReporter(enabled=not args.quiet, verbose=args.verbose, stream=sys.stderr, ui=args.ui)
 
     return _dispatch_command(args, router, app_config, progress)
 
@@ -168,7 +190,7 @@ def _dispatch_command(
         "plan": lambda: _cmd_plan(args, router, app_config, progress),
         "run": lambda: _cmd_run(args, router, app_config, progress),
         "build": lambda: _cmd_build(args, router, app_config, progress),
-        "accept": lambda: _cmd_accept(args, app_config),
+        "accept": lambda: _cmd_accept(args, router, app_config, progress),
         "report": lambda: _cmd_report(args, app_config),
     }
     handler = handlers.get(args.command)
@@ -430,6 +452,7 @@ def _run_accept_plan_phase(
     run: RunState,
     wf: WorkflowState,
     router: ProviderRouter,
+    app_config: AppConfig,
     execution,
     permission_mode: str | None,
     progress: ProgressReporter,
@@ -437,6 +460,13 @@ def _run_accept_plan_phase(
     if session.non_interactive:
         accept_plan(run)
         wf.touch_accepted_plan()
+        prepare_implementation_entry(
+            app_config.workspace,
+            wf,
+            run,
+            base_branch_override=app_config.build.base_branch,
+        )
+        save_workflow_state(run.run_dir, wf)
         transition_stage(wf, "pre_build")
         save_workflow_state(run.run_dir, wf)
         return run
@@ -452,6 +482,13 @@ def _run_accept_plan_phase(
     if reviewed is None:
         print(f"Report: {run.run_dir / 'report.md'}")
         return 130
+    prepare_implementation_entry(
+        app_config.workspace,
+        wf,
+        reviewed,
+        base_branch_override=app_config.build.base_branch,
+    )
+    save_workflow_state(reviewed.run_dir, wf)
     transition_stage(wf, "pre_build")
     save_workflow_state(reviewed.run_dir, wf)
     return reviewed
@@ -497,6 +534,7 @@ def _run_build_review_completion(
         permission_mode_cli=args.permission_mode,
         progress=progress.update,
         runs_root=app_config.runs_dir,
+        build_create_pr=app_config.build.create_pr,
     )
     return exit_code
 
@@ -524,6 +562,7 @@ def _cmd_run(
         run,
         wf,
         router,
+        app_config,
         execution,
         args.permission_mode,
         progress,
@@ -537,15 +576,83 @@ def _cmd_run(
     return _run_build_review_completion(args, session, router, app_config, execution, wf, run, progress)
 
 
-def _cmd_accept(args: argparse.Namespace, app_config: AppConfig) -> int:
+def _cmd_accept(
+    args: argparse.Namespace,
+    router: ProviderRouter,
+    app_config: AppConfig,
+    progress: ProgressReporter,
+) -> int:
     run_dir = resolve_workspace_relative_path(app_config.workspace, args.run_dir)
     raw = load_state(run_dir)
     run = _state_from_json(raw, run_dir)
     run = accept_plan(run)
     print(f"Accepted plan: {run.run_dir / '04-accepted-plan.md'}")
-    print(f"Build with: llm-plan-execute build --run-dir {run.run_dir}")
-    print(f"Report: {run.run_dir / 'report.md'}")
-    return 0
+    if not _accept_should_build(args):
+        print(f"Build with: llm-plan-execute build --run-dir {run.run_dir}")
+        print(f"Report: {run.run_dir / 'report.md'}")
+        return 0
+    return _continue_build_after_accept(args, router, app_config, progress, run)
+
+
+def _accept_should_build(args: argparse.Namespace) -> bool:
+    if args.no_build:
+        return False
+    if args.build:
+        return True
+    if args.non_interactive or not sys.stdin.isatty():
+        return False
+    print("Build now? [Y/n]", flush=True)
+    try:
+        answer = input().strip().lower()
+    except EOFError:
+        answer = "n"
+    return answer in {"", "y", "yes"}
+
+
+def _continue_build_after_accept(
+    args: argparse.Namespace,
+    router: ProviderRouter,
+    app_config: AppConfig,
+    progress: ProgressReporter,
+    run: RunState,
+) -> int:
+    execution = merge_execution_dirs(app_config.workspace, app_config.execution, args.writable_dir)
+    session = InteractiveSession(
+        non_interactive=args.non_interactive or not sys.stdin.isatty(),
+        on_verbose_change=lambda enabled: setattr(progress, "verbose", enabled),
+    )
+    wf = load_workflow_state(run.run_dir)
+    lock_acquired = False
+    try:
+        acquire_workflow_lock(run.run_dir, force=False)
+        lock_acquired = True
+        run._last_local_progress = "preparing workspace, context store, and task branch"  # type: ignore[attr-defined]
+        progress.update("local", "workflow", run, None, None, None)
+        prepare_implementation_entry(
+            app_config.workspace,
+            wf,
+            run,
+            base_branch_override=app_config.build.base_branch,
+        )
+        save_workflow_state(run.run_dir, wf)
+        if wf.stage not in {"pre_build", "build", "build_review"}:
+            transition_stage(wf, "pre_build")
+            save_workflow_state(run.run_dir, wf)
+        _, exit_code = execute_build_through_completion(
+            run=run,
+            wf=wf,
+            router=router,
+            execution=execution,
+            session=session,
+            permission_mode_cli=args.permission_mode,
+            progress=progress.update,
+            runs_root=app_config.runs_dir,
+            build_create_pr=app_config.build.create_pr,
+        )
+        return exit_code
+    finally:
+        if lock_acquired:
+            release_workflow_lock(run.run_dir)
 
 
 def _cmd_build(
@@ -567,6 +674,13 @@ def _cmd_build(
     try:
         acquire_workflow_lock(run.run_dir, force=args.force_session)
         lock_acquired = True
+        prepare_implementation_entry(
+            app_config.workspace,
+            wf,
+            run,
+            base_branch_override=app_config.build.base_branch,
+        )
+        save_workflow_state(run.run_dir, wf)
         if wf.stage not in {"pre_build", "build", "build_review"}:
             transition_stage(wf, "pre_build")
             save_workflow_state(run.run_dir, wf)
@@ -593,6 +707,7 @@ def _cmd_build(
             permission_mode_cli=args.permission_mode,
             progress=progress.update,
             runs_root=app_config.runs_dir,
+            build_create_pr=app_config.build.create_pr,
         )
         return exit_code
     finally:
@@ -758,10 +873,12 @@ def _execution_policies_from_json(value: object) -> dict[str, ExecutionPolicy]:
 
 
 class ProgressReporter:
-    def __init__(self, *, enabled: bool, verbose: bool, stream: Any) -> None:
+    def __init__(self, *, enabled: bool, verbose: bool, stream: Any, ui: str = "auto") -> None:
         self.enabled = enabled
         self.verbose = verbose
         self.stream = stream
+        self.ui = self._resolve_ui(ui, stream)
+        self.console = self._make_console(stream) if self.ui == "rich" else None
         self.starts: dict[str, float] = {}
 
     def update(
@@ -783,15 +900,34 @@ class ProgressReporter:
             self._finish(role, run, label, model, result)
             return
         if event == "heartbeat":
-            print(f"[{run.run_id}] {label}: still running...", file=self.stream)
+            self._heartbeat(role, run, label, model)
+            return
+        if event == "activity":
+            self._activity(run)
+            return
+        if event == "local":
+            self._local(run, label)
             return
         if event == "artifact" and artifact:
-            print(f"[{run.run_id}] {label}: wrote {artifact}", file=self.stream)
+            self._emit(run.run_id, label, f"wrote {artifact}", status="artifact")
+
+    def _resolve_ui(self, ui: str, stream: Any) -> str:
+        if ui == "auto":
+            return "rich" if hasattr(stream, "isatty") and stream.isatty() and self._rich_available() else "plain"
+        if ui == "rich" and not self._rich_available():
+            return "plain"
+        return ui
+
+    def _rich_available(self) -> bool:
+        return True
+
+    def _make_console(self, stream: Any) -> Any:
+        return Console(file=stream, stderr=stream is sys.stderr)
 
     def _start(self, role: str, run: RunState, label: str, model: ModelInfo | None) -> None:
         self.starts[role] = time.monotonic()
         model_id = model.id if model else "unassigned"
-        print(f"[{run.run_id}] {label}: starting with {model_id}", file=self.stream)
+        self._emit(run.run_id, label, f"starting with {model_id}; {_role_activity(role)}", status="start")
 
     def _finish(
         self,
@@ -804,6 +940,84 @@ class ProgressReporter:
         elapsed = result.elapsed_seconds if result else time.monotonic() - self.starts.get(role, time.monotonic())
         model_id = result.model.id if result else (model.id if model else "unassigned")
         suffix = " failed" if result and result.error else " done"
-        print(f"[{run.run_id}] {label}: {model_id}{suffix} in {elapsed:.1f}s", file=self.stream)
+        self._emit(run.run_id, label, f"{model_id}{suffix} in {elapsed:.1f}s", status="finish")
         if self.verbose and result and result.error:
-            print(f"[{run.run_id}] {label}: {result.error}", file=self.stream)
+            self._emit(run.run_id, label, result.error, status="error")
+
+    def _heartbeat(self, role: str, run: RunState, label: str, model: ModelInfo | None) -> None:
+        elapsed = time.monotonic() - self.starts.get(role, time.monotonic())
+        model_id = model.id if model else "unassigned"
+        self._emit(
+            run.run_id,
+            label,
+            f"waiting on {model_id} for {_format_elapsed(elapsed)}; {_role_activity(role)}",
+            status="running",
+        )
+
+    def _activity(self, run: RunState) -> None:
+        activity = getattr(run, "_last_provider_activity", None)
+        if activity is None:
+            return
+        label = activity.role.replace("_", " ")
+        self._emit(
+            run.run_id,
+            label,
+            f"{activity.message} ({_format_elapsed(activity.elapsed_seconds)})",
+            status="activity",
+            extra={
+                "kind": activity.kind,
+                "tool_name": activity.tool_name,
+                "workspace_path": activity.workspace_path,
+                "command": activity.command,
+                "model": activity.model.id,
+            },
+        )
+
+    def _local(self, run: RunState, label: str) -> None:
+        message = getattr(run, "_last_local_progress", None)
+        if not message:
+            return
+        self._emit(run.run_id, label, str(message), status="local")
+
+    def _emit(
+        self,
+        run_id: str,
+        label: str,
+        message: str,
+        *,
+        status: str,
+        extra: dict[str, object | None] | None = None,
+    ) -> None:
+        if self.ui == "jsonl":
+            payload = {"run_id": run_id, "role": label, "status": status, "message": message}
+            if extra:
+                payload.update({key: value for key, value in extra.items() if value is not None})
+            print(json.dumps(payload), file=self.stream)
+            return
+        if self.console is not None:
+            self.console.print(f"[dim]{run_id}[/dim] [bold]{label}[/bold]: {message}")
+            return
+        print(f"[{run_id}] {label}: {message}", file=self.stream)
+
+
+def _format_elapsed(seconds: float) -> str:
+    seconds_per_minute = 60
+    if seconds < seconds_per_minute:
+        return f"{int(seconds)}s"
+    minutes, secs = divmod(int(seconds), seconds_per_minute)
+    return f"{minutes}m{secs:02d}s"
+
+
+def _role_activity(role: str) -> str:
+    labels = {
+        "clarifier": "checking whether the request needs clarification",
+        "planner": "drafting the implementation plan",
+        "plan_reviewer_a": "reviewing the draft plan",
+        "plan_reviewer_b": "reviewing the draft plan",
+        "plan_arbiter": "merging plan feedback into a proposed plan",
+        "builder": "applying the accepted plan",
+        "build_reviewer_a": "reviewing implementation output",
+        "build_reviewer_b": "reviewing implementation output",
+        "build_arbiter": "summarizing build review findings",
+    }
+    return labels.get(role, "working")

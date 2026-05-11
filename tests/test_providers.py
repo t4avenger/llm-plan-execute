@@ -11,6 +11,8 @@ from llm_plan_execute.providers import (
     CursorAdapter,
     Provider,
     ProviderRouter,
+    _activity_from_stream_line,
+    _streaming_args,
 )
 from llm_plan_execute.types import ExecutionPolicy, ModelInfo, ProviderResult, Usage
 
@@ -257,6 +259,32 @@ def test_claude_provider_reports_unresolved_command(monkeypatch):
         "Provider command 'claude' could not be resolved via PATH lookup or as a configured executable path."
     )
     assert result.output == result.error
+
+
+def test_streaming_args_enable_provider_json_modes():
+    assert "--json" in _streaming_args("codex", ["codex", "exec", "--model", "m", "prompt"])
+    cursor = _streaming_args("cursor", ["cursor-agent", "--print", "--output-format", "text", "prompt"])
+    assert "stream-json" in cursor
+    assert "--stream-partial-output" in cursor
+    claude = _streaming_args("claude", ["claude", "--model", "sonnet", "prompt"])
+    assert "--print" in claude
+    assert "stream-json" in claude
+
+
+def test_activity_from_stream_line_extracts_file_activity(tmp_path):
+    model = ModelInfo("codex", "gpt")
+    activity = _activity_from_stream_line(
+        "codex",
+        '{"type": "tool_call", "tool_name": "read", "path": "src/app.py"}',
+        role="builder",
+        model=model,
+        elapsed=12.5,
+        workspace=tmp_path,
+    )
+
+    assert activity is not None
+    assert activity.workspace_path == "src/app.py"
+    assert activity.message == "reading src/app.py"
 
 
 def test_cli_provider_reports_missing_command(monkeypatch):

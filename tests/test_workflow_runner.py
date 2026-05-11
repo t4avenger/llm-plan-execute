@@ -18,6 +18,9 @@ from llm_plan_execute.interactive import (
 from llm_plan_execute.types import RunState
 from llm_plan_execute.workflow import BuildFailedError
 from llm_plan_execute.workflow_runner import (
+    _checkpoint_build_milestones,
+    _checkpoint_review_fixes,
+    _finish_build_completion,
     execute_build_through_completion,
     finalize_completion_reports,
     gate_stage_transition,
@@ -28,6 +31,8 @@ from llm_plan_execute.workflow_runner import (
     resolve_build_permission,
 )
 from llm_plan_execute.workflow_state import WorkflowState
+
+CANCELED_EXIT = 130
 
 
 def _noop_progress(*_args, **_kwargs) -> None:
@@ -182,11 +187,19 @@ def test_interactive_build_review_loop_records_apply_selection(monkeypatch, tmp_
     runs_root = tmp_path / "runs"
     run = RunState.create("prompt", runs_root)
     run.run_dir.mkdir(parents=True)
+    run.accepted_plan = "accepted plan"
+    run.build_output = "build output"
     (run.run_dir / "08-build-review-summary.md").write_text("- finding\n", encoding="utf-8")
     wf = WorkflowState()
     calls: list[list[str]] = []
+    router = MagicMock()
+    router.workspace = tmp_path
     monkeypatch.setattr("llm_plan_execute.workflow_runner.record_build_recommendation_application", lambda *_args: None)
     monkeypatch.setattr("llm_plan_execute.workflow_runner._write_apply_follow_up_notes", lambda *_args: None)
+    monkeypatch.setattr(
+        "llm_plan_execute.workflow_runner.apply_build_recommendation_fixes",
+        lambda run, *_args, **_kw: run,
+    )
 
     def fake_expand(selected, _recommendations):
         calls.append(list(selected))
@@ -196,9 +209,9 @@ def test_interactive_build_review_loop_records_apply_selection(monkeypatch, tmp_
 
     assert (
         interactive_build_review_loop(
-            session=_BuildReviewSession("applyAll"),
+            session=_BuildReviewSession("applyAll", "continueWithoutApplying"),
             run=run,
-            router=MagicMock(),
+            router=router,
             execution=ExecutionConfig(),
             permission_mode=None,
             progress=_noop_progress,
@@ -206,8 +219,7 @@ def test_interactive_build_review_loop_records_apply_selection(monkeypatch, tmp_
         )
         is None
     )
-    assert wf.build_review_selected_action == "applyAll"
-    assert wf.build_review_selected_ids == ["finding-1"]
+    assert wf.build_review_selected_action == "continueWithoutApplying"
     assert wf.build_review_applied_ids == ["finding-1"]
     assert calls == [["finding-1"]]
 
@@ -216,17 +228,25 @@ def test_interactive_build_review_loop_feedback_then_select(monkeypatch, tmp_pat
     runs_root = tmp_path / "runs"
     run = RunState.create("prompt", runs_root)
     run.run_dir.mkdir(parents=True)
+    run.accepted_plan = "accepted plan"
+    run.build_output = "build output"
     (run.run_dir / "08-build-review-summary.md").write_text("- first\n- second\n", encoding="utf-8")
     wf = WorkflowState()
+    router = MagicMock()
+    router.workspace = tmp_path
     monkeypatch.setattr("llm_plan_execute.workflow_runner.record_build_recommendation_application", lambda *_args: None)
     monkeypatch.setattr("llm_plan_execute.workflow_runner._write_apply_follow_up_notes", lambda *_args: None)
     monkeypatch.setattr("llm_plan_execute.workflow_runner.rerun_build_review", lambda run, *_args, **_kwargs: run)
+    monkeypatch.setattr(
+        "llm_plan_execute.workflow_runner.apply_build_recommendation_fixes",
+        lambda run, *_args, **_kw: run,
+    )
 
     assert (
         interactive_build_review_loop(
-            session=_BuildReviewSession("feedback", "select", selection=("2",)),
+            session=_BuildReviewSession("feedback", "select", "continueWithoutApplying", selection=("2",)),
             run=run,
-            router=MagicMock(),
+            router=router,
             execution=ExecutionConfig(),
             permission_mode=None,
             progress=_noop_progress,
@@ -235,7 +255,6 @@ def test_interactive_build_review_loop_feedback_then_select(monkeypatch, tmp_pat
         is None
     )
     assert wf.build_review_feedback_history == ["rerun review"]
-    assert wf.build_review_selected_ids == ["finding-2"]
     assert wf.build_review_applied_ids == ["finding-2"]
 
 
@@ -294,6 +313,7 @@ def test_execute_build_through_completion_exit_zero(monkeypatch, tmp_path: Path)
         "llm_plan_execute.workflow_runner.finalize_completion_reports",
         _stub_none,
     )
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.maybe_offer_github_pr", lambda **_: None)
 
     runs_root = tmp_path / "runs"
     runs_root.mkdir()
@@ -302,10 +322,13 @@ def test_execute_build_through_completion_exit_zero(monkeypatch, tmp_path: Path)
     run.accepted_plan = "plan body"
     wf = WorkflowState(stage="pre_build")  # valid precondition for execute_build_through_completion
 
+    router = MagicMock()
+    router.workspace = tmp_path
+
     _, code = execute_build_through_completion(
         run=run,
         wf=wf,
-        router=MagicMock(),
+        router=router,
         execution=ExecutionConfig(),
         session=InteractiveSession(non_interactive=True),
         permission_mode_cli=None,
@@ -327,6 +350,7 @@ def test_execute_build_through_completion_resumes_at_build_review_skips_run_buil
     monkeypatch.setattr("llm_plan_execute.workflow_runner.run_build", spy_run_build)
     monkeypatch.setattr("llm_plan_execute.workflow_runner.interactive_build_review_loop", _stub_none)
     monkeypatch.setattr("llm_plan_execute.workflow_runner.finalize_completion_reports", _stub_none)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.maybe_offer_github_pr", lambda **_: None)
 
     runs_root = tmp_path / "runs"
     runs_root.mkdir()
@@ -335,10 +359,13 @@ def test_execute_build_through_completion_resumes_at_build_review_skips_run_buil
     run.accepted_plan = "plan body"
     wf = WorkflowState(stage="build_review")
 
+    router = MagicMock()
+    router.workspace = tmp_path
+
     _, code = execute_build_through_completion(
         run=run,
         wf=wf,
-        router=MagicMock(),
+        router=router,
         execution=ExecutionConfig(),
         session=InteractiveSession(non_interactive=True),
         permission_mode_cli=None,
@@ -356,6 +383,7 @@ def test_execute_build_through_completion_propagates_build_failed(monkeypatch, t
         raise BuildFailedError("fail", run)
 
     monkeypatch.setattr("llm_plan_execute.workflow_runner.run_build", boom)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.maybe_offer_github_pr", lambda **_: None)
 
     runs_root = tmp_path / "runs"
     runs_root.mkdir()
@@ -364,10 +392,13 @@ def test_execute_build_through_completion_propagates_build_failed(monkeypatch, t
     run.accepted_plan = "plan"
     wf = WorkflowState()
 
+    router = MagicMock()
+    router.workspace = tmp_path
+
     _, code = execute_build_through_completion(
         run=run,
         wf=wf,
-        router=MagicMock(),
+        router=router,
         execution=ExecutionConfig(),
         session=InteractiveSession(non_interactive=True),
         permission_mode_cli=None,
@@ -376,6 +407,73 @@ def test_execute_build_through_completion_propagates_build_failed(monkeypatch, t
     )
     assert code == 1
     assert wf.lifecycle_status == "failed"
+
+
+def test_checkpoint_build_milestones_records_test_context(monkeypatch, tmp_path: Path) -> None:
+    calls: list[tuple[str, str, list[str]]] = []
+    added: list[dict[str, object]] = []
+
+    class FakeContext:
+        def __init__(self, _workspace: Path) -> None:
+            pass
+
+        def init(self) -> None:
+            return None
+
+        def add_context_item(self, **kwargs: object) -> None:
+            added.append(kwargs)
+
+    def fake_commit(_root: Path, label: str, summary: str, paths: list[str], **_kwargs: object):
+        calls.append((label, summary, paths))
+
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.ContextStore", FakeContext)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.commit_checkpoint", fake_commit)
+    run = RunState.create("prompt", tmp_path)
+
+    _checkpoint_build_milestones(tmp_path, tmp_path, run, ["src/a.py", "tests/test_a.py"], runs_root=tmp_path / "runs")
+
+    assert calls == [("implementation-complete", "post-build workspace changes", ["src/a.py", "tests/test_a.py"])]
+    assert added[0]["metadata"]["label"] == "tests-added-or-updated"
+
+
+def test_checkpoint_review_fixes_commits_changed_paths(monkeypatch, tmp_path: Path) -> None:
+    calls: list[tuple[str, list[str]]] = []
+
+    class FakeContext:
+        def __init__(self, _workspace: Path) -> None:
+            pass
+
+        def init(self) -> None:
+            return None
+
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.find_git_root", lambda _workspace: tmp_path)
+    monkeypatch.setattr(
+        "llm_plan_execute.workflow_runner.git_changed_pathspecs",
+        lambda _root, **_kwargs: ["src/a.py"],
+    )
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.ContextStore", FakeContext)
+    monkeypatch.setattr(
+        "llm_plan_execute.workflow_runner.commit_checkpoint",
+        lambda _root, label, _summary, paths, **_kwargs: calls.append((label, paths)),
+    )
+
+    run = RunState.create("prompt", tmp_path)
+    _checkpoint_review_fixes(tmp_path, run, WorkflowState(task_id="tid"), runs_root=tmp_path / "runs")
+
+    assert calls == [("review-fixes-complete", ["src/a.py"])]
+
+
+def test_finish_build_completion_cancel(tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run = RunState.create("prompt", runs_root)
+    run.run_dir.mkdir(parents=True)
+    wf = WorkflowState(stage="build_review")
+
+    result, code = _finish_build_completion(run=run, wf=wf, session=_CompletionSession("cancel"))
+
+    assert result is run
+    assert code == CANCELED_EXIT
+    assert wf.lifecycle_status == "canceled"
 
 
 class _StageSession:

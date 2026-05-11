@@ -457,6 +457,40 @@ def test_progress_uses_stderr_and_leaves_stdout_clean(tmp_path, capsys, monkeypa
     assert "planner: starting" not in captured.out
 
 
+def test_progress_jsonl_outputs_structured_progress(tmp_path, capsys, monkeypatch):
+    config = _write_dry_config(tmp_path)
+    _scripted_tty_stdin(monkeypatch, "1")
+
+    exit_code = main(
+        [*_config_args(tmp_path, config), "--ui", "jsonl", "plan", "--prompt", "Add a small feature", "--no-clarify"]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    first = json.loads(captured.err.splitlines()[0])
+    assert first["status"] == "start"
+    assert first["role"] == "planner"
+
+
+def test_accept_no_build_suppresses_interactive_build_prompt(tmp_path, capsys, monkeypatch):
+    config = _write_dry_config(tmp_path)
+    _scripted_tty_stdin(monkeypatch, "4")
+
+    exit_plan = main([*_config_args(tmp_path, config), "plan", "--prompt", "Add a small feature", "--no-clarify"])
+    assert exit_plan == CANCELED_EXIT
+    captured = capsys.readouterr()
+    run_line = next(line for line in captured.out.splitlines() if line.startswith("Run:"))
+    run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
+
+    _scripted_tty_stdin(monkeypatch)
+    exit_code = main([*_config_args(tmp_path, config), "accept", "--run-dir", str(run_dir), "--no-build"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Build with:" in captured.out
+    assert not (run_dir / "05-build-output.md").exists()
+
+
 def test_plan_non_tty_auto_accepts_without_flag(tmp_path, capsys, monkeypatch):
     config = _write_dry_config(tmp_path)
     monkeypatch.setattr("sys.stdin", io.StringIO())

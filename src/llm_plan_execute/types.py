@@ -69,6 +69,18 @@ class ProviderResult:
 
 
 @dataclass(frozen=True)
+class ProviderActivity:
+    role: str
+    model: ModelInfo
+    kind: str
+    message: str
+    tool_name: str | None = None
+    workspace_path: str | None = None
+    command: str | None = None
+    elapsed_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
 class ExecutionPolicy:
     mode: str = "workspace-write"
     writable_dirs: tuple[Path, ...] = ()
