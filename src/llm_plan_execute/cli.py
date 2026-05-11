@@ -43,7 +43,14 @@ from .workflow_runner import (
     merge_execution_dirs,
     orchestrate_clarification,
 )
-from .workflow_state import WorkflowState, load_workflow_state, save_workflow_state
+from .workflow_state import (
+    WorkflowState,
+    acquire_workflow_lock,
+    load_workflow_state,
+    release_workflow_lock,
+    save_workflow_state,
+    transition_stage,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -61,6 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true", help="Show provider error details in progress output.")
     parser.add_argument(
         "--non-interactive",
+        "--ci",
         action="store_true",
         help="Use deterministic defaults for menus (also implied when stdin is not a TTY).",
     )
@@ -106,6 +114,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     build.add_argument("--run-dir", type=Path, required=True)
+    build.add_argument(
+        "--force-session",
+        action="store_true",
+        help="Override a stale session lock from a previously crashed run.",
+    )
     _add_permission_args(build)
 
     report = sub.add_parser("report", help="Render a report for a run.")
@@ -262,7 +275,7 @@ def _plan_run_planning_phase(
             permission_mode=args.permission_mode,
             progress=progress.update,
         )
-        wf.stage = "plan_review"
+        transition_stage(wf, "plan_review")
         save_workflow_state(run.run_dir, wf)
         if args.yes:
             wf.touch_accepted_plan()
@@ -347,7 +360,10 @@ def _cmd_plan(
 ) -> int:
     prompt = _read_prompt(app_config.workspace, args.prompt, args.prompt_file)
     execution = merge_execution_dirs(app_config.workspace, app_config.execution, args.writable_dir)
-    session = InteractiveSession(non_interactive=args.non_interactive or not sys.stdin.isatty())
+    session = InteractiveSession(
+        non_interactive=args.non_interactive or not sys.stdin.isatty(),
+        on_verbose_change=lambda enabled: setattr(progress, "verbose", enabled),
+    )
     wf = WorkflowState()
     planned = _plan_run_planning_phase(args, prompt, router, app_config, execution, progress, wf, session)
     if isinstance(planned, int):
@@ -377,7 +393,7 @@ def _run_planning_only(
             permission_mode=args.permission_mode,
             progress=progress.update,
         )
-        wf.stage = "plan_review"
+        transition_stage(wf, "plan_review")
         save_workflow_state(run.run_dir, wf)
         return run
     outcome = orchestrate_clarification(
@@ -421,7 +437,7 @@ def _run_accept_plan_phase(
     if session.non_interactive:
         accept_plan(run)
         wf.touch_accepted_plan()
-        wf.stage = "pre_build"
+        transition_stage(wf, "pre_build")
         save_workflow_state(run.run_dir, wf)
         return run
     reviewed = interactive_plan_review(
@@ -436,7 +452,7 @@ def _run_accept_plan_phase(
     if reviewed is None:
         print(f"Report: {run.run_dir / 'report.md'}")
         return 130
-    wf.stage = "pre_build"
+    transition_stage(wf, "pre_build")
     save_workflow_state(reviewed.run_dir, wf)
     return reviewed
 
@@ -493,7 +509,10 @@ def _cmd_run(
 ) -> int:
     prompt = _read_prompt(app_config.workspace, args.prompt, args.prompt_file)
     execution = merge_execution_dirs(app_config.workspace, app_config.execution, args.writable_dir)
-    session = InteractiveSession(non_interactive=args.non_interactive or not sys.stdin.isatty())
+    session = InteractiveSession(
+        non_interactive=args.non_interactive or not sys.stdin.isatty(),
+        on_verbose_change=lambda enabled: setattr(progress, "verbose", enabled),
+    )
     wf = WorkflowState()
     planned = _run_planning_only(args, prompt, router, app_config, execution, progress, wf, session)
     if isinstance(planned, int):
@@ -539,35 +558,46 @@ def _cmd_build(
     raw = load_state(run_dir)
     run = _state_from_json(raw, run_dir)
     execution = merge_execution_dirs(app_config.workspace, app_config.execution, args.writable_dir)
-    session = InteractiveSession(non_interactive=args.non_interactive or not sys.stdin.isatty())
-    wf = load_workflow_state(run.run_dir)
-    wf.stage = "pre_build"
-    save_workflow_state(run.run_dir, wf)
-
-    if not session.non_interactive:
-        transition = gate_stage_transition(session=session, wf=wf, run=run)
-        if transition == "pause":
-            state_path = save_workflow_state(run.run_dir, wf)
-            print("Workflow paused before build; state preserved.")
-            print(f"Workflow state: {state_path}")
-            print(f"Continue with: llm-plan-execute build --run-dir {run.run_dir}")
-            print(f"Report: {run.run_dir / 'report.md'}")
-            return PAUSED_EXIT_CODE
-        if transition == "cancel":
-            print(f"Report: {run.run_dir / 'report.md'}")
-            return 130
-
-    _, exit_code = execute_build_through_completion(
-        run=run,
-        wf=wf,
-        router=router,
-        execution=execution,
-        session=session,
-        permission_mode_cli=args.permission_mode,
-        progress=progress.update,
-        runs_root=app_config.runs_dir,
+    session = InteractiveSession(
+        non_interactive=args.non_interactive or not sys.stdin.isatty(),
+        on_verbose_change=lambda enabled: setattr(progress, "verbose", enabled),
     )
-    return exit_code
+    wf = load_workflow_state(run.run_dir)
+    lock_acquired = False
+    try:
+        acquire_workflow_lock(run.run_dir, force=args.force_session)
+        lock_acquired = True
+        if wf.stage not in {"pre_build", "build", "build_review"}:
+            transition_stage(wf, "pre_build")
+            save_workflow_state(run.run_dir, wf)
+
+        if not session.non_interactive and wf.stage != "build_review":
+            transition = gate_stage_transition(session=session, wf=wf, run=run)
+            if transition == "pause":
+                state_path = save_workflow_state(run.run_dir, wf)
+                print("Workflow paused before build; state preserved.")
+                print(f"Workflow state: {state_path}")
+                print(f"Continue with: llm-plan-execute build --run-dir {run.run_dir}")
+                print(f"Report: {run.run_dir / 'report.md'}")
+                return PAUSED_EXIT_CODE
+            if transition == "cancel":
+                print(f"Report: {run.run_dir / 'report.md'}")
+                return 130
+
+        _, exit_code = execute_build_through_completion(
+            run=run,
+            wf=wf,
+            router=router,
+            execution=execution,
+            session=session,
+            permission_mode_cli=args.permission_mode,
+            progress=progress.update,
+            runs_root=app_config.runs_dir,
+        )
+        return exit_code
+    finally:
+        if lock_acquired:
+            release_workflow_lock(run.run_dir)
 
 
 def _cmd_report(args: argparse.Namespace, app_config: AppConfig) -> int:
@@ -751,6 +781,9 @@ class ProgressReporter:
             return
         if event == "finish":
             self._finish(role, run, label, model, result)
+            return
+        if event == "heartbeat":
+            print(f"[{run.run_id}] {label}: still running...", file=self.stream)
             return
         if event == "artifact" and artifact:
             print(f"[{run.run_id}] {label}: wrote {artifact}", file=self.stream)

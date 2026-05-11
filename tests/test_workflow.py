@@ -204,9 +204,11 @@ def test_run_provider_emits_finish_progress_when_router_raises(tmp_path):
     with pytest.raises(ValueError, match="No provider can run"):
         _run_provider(run, ProviderRouter([]), "builder", model, "prompt", ExecutionPolicy(), record)
 
+    # Heartbeat now fires on a 30-second interval thread, not before the call,
+    # so it won't appear in a fast-failing provider test.
     assert [event[0] for event in events] == ["start", "finish"]
-    assert events[1][4] is not None
-    assert events[1][4].error is not None
+    assert events[-1][4] is not None
+    assert events[-1][4].error is not None
 
 
 def test_provider_warning_is_recorded_on_run(tmp_path):

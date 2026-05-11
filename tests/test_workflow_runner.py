@@ -300,7 +300,7 @@ def test_execute_build_through_completion_exit_zero(monkeypatch, tmp_path: Path)
     run = RunState.create("prompt", runs_root)
     run.run_dir.mkdir(parents=True)
     run.accepted_plan = "plan body"
-    wf = WorkflowState()
+    wf = WorkflowState(stage="pre_build")  # valid precondition for execute_build_through_completion
 
     _, code = execute_build_through_completion(
         run=run,
@@ -313,7 +313,42 @@ def test_execute_build_through_completion_exit_zero(monkeypatch, tmp_path: Path)
         runs_root=runs_root,
     )
     assert code == 0
-    assert wf.stage == "build_review"
+    assert wf.stage == "complete"  # stage advances through build_review to complete
+
+
+def test_execute_build_through_completion_resumes_at_build_review_skips_run_build(monkeypatch, tmp_path: Path) -> None:
+    """When wf.stage is already build_review, run_build must not be called."""
+    build_called: list[bool] = []
+
+    def spy_run_build(run, _router, **_kw):
+        build_called.append(True)
+        return run
+
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.run_build", spy_run_build)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.interactive_build_review_loop", _stub_none)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.finalize_completion_reports", _stub_none)
+
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    run = RunState.create("prompt", runs_root)
+    run.run_dir.mkdir(parents=True)
+    run.accepted_plan = "plan body"
+    wf = WorkflowState(stage="build_review")
+
+    _, code = execute_build_through_completion(
+        run=run,
+        wf=wf,
+        router=MagicMock(),
+        execution=ExecutionConfig(),
+        session=InteractiveSession(non_interactive=True),
+        permission_mode_cli=None,
+        progress=_noop_progress,
+        runs_root=runs_root,
+    )
+
+    assert code == 0
+    assert build_called == []
+    assert wf.stage == "complete"
 
 
 def test_execute_build_through_completion_propagates_build_failed(monkeypatch, tmp_path: Path) -> None:

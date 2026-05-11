@@ -1,10 +1,12 @@
 import io
 import json
+import os
 from pathlib import Path
 
 from llm_plan_execute.cli import _state_from_json, main
 from llm_plan_execute.config import sample_config
 from llm_plan_execute.interactive import session_with_mock_stdin
+from llm_plan_execute.workflow_state import workflow_lock_path
 
 CLARIFICATION_NEEDED_EXIT = 2
 CANCELED_EXIT = 130
@@ -485,6 +487,7 @@ def test_pause_then_build_non_interactive_completes(tmp_path, capsys, monkeypatc
     assert (run_dir / "05-build-output.md").exists()
     wf = json.loads((run_dir / "workflow-state.json").read_text(encoding="utf-8"))
     assert wf.get("lifecycle_status") == "completed"
+    assert wf.get("stage") == "complete"
 
 
 def test_non_interactive_run_flag_completes(tmp_path, capsys):
@@ -505,6 +508,14 @@ def test_non_interactive_run_flag_completes(tmp_path, capsys):
     assert exit_code == 0
     assert "Build output:" in captured.out
     assert "Review summary:" in captured.out
+
+
+def test_ci_alias_behaves_like_non_interactive(tmp_path, capsys):
+    config = _write_dry_config(tmp_path)
+    exit_code = main([*_config_args(tmp_path, config), "--ci", "run", "--prompt", "Add feature", "--no-clarify"])
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Build output:" in captured.out
 
 
 def test_plan_save_workflow_state_failure_returns_one(tmp_path, capsys, monkeypatch):
@@ -529,3 +540,96 @@ def test_plan_review_menu_lists_core_actions():
     assert "Accept plan" in transcript
     assert "Modify plan" in transcript
     assert "Step through plan" in transcript
+
+
+def test_complete_stage_is_reached_after_full_non_interactive_run(tmp_path, capsys):
+    config = _write_dry_config(tmp_path)
+    exit_code = main(
+        [
+            *_config_args(tmp_path, config),
+            "--non-interactive",
+            "run",
+            "--prompt",
+            "Add a small feature",
+            "--no-clarify",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    run_line = next(line for line in captured.out.splitlines() if line.startswith("Run:"))
+    run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
+    wf = json.loads((run_dir / "workflow-state.json").read_text(encoding="utf-8"))
+    assert wf.get("stage") == "complete"
+    assert wf.get("lifecycle_status") == "completed"
+
+
+def test_force_session_overrides_stale_lock(tmp_path, capsys):
+    """--force-session lets build proceed when a stale lock file is present."""
+    config = _write_dry_config(tmp_path)
+    main([*_config_args(tmp_path, config), "plan", "--prompt", "Add feature", "--no-clarify", "--yes"])
+    captured = capsys.readouterr()
+    run_line = next(line for line in captured.out.splitlines() if line.startswith("Run:"))
+    run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
+
+    # Inject a stale lock (PID 0 is always dead)
+    lock_path = workflow_lock_path(run_dir)
+    lock_path.write_text("0\n", encoding="utf-8")
+
+    exit_build = main(
+        [
+            *_config_args(tmp_path, config),
+            "--non-interactive",
+            "build",
+            "--run-dir",
+            str(run_dir),
+            "--force-session",
+        ]
+    )
+    capsys.readouterr()
+    assert exit_build == 0
+
+
+def test_build_without_force_session_fails_on_live_lock(tmp_path, capsys):
+    """Without --force-session, a live-PID lock raises an error."""
+    config = _write_dry_config(tmp_path)
+    main([*_config_args(tmp_path, config), "plan", "--prompt", "Add feature", "--no-clarify", "--yes"])
+    captured = capsys.readouterr()
+    run_line = next(line for line in captured.out.splitlines() if line.startswith("Run:"))
+    run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
+
+    # Write current process PID — definitely alive
+    workflow_lock_path(run_dir).write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    exit_build = main(
+        [
+            *_config_args(tmp_path, config),
+            "--non-interactive",
+            "build",
+            "--run-dir",
+            str(run_dir),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_build == 1
+    assert "--force-session" in captured.err
+
+
+def test_build_resumes_at_build_review_stage_skips_gate(tmp_path, capsys, monkeypatch):
+    """When workflow-state stage is already build_review, the pre-build gate is bypassed."""
+    config = _write_dry_config(tmp_path)
+    main([*_config_args(tmp_path, config), "plan", "--prompt", "Add feature", "--no-clarify", "--yes"])
+    captured = capsys.readouterr()
+    run_line = next(line for line in captured.out.splitlines() if line.startswith("Run:"))
+    run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
+
+    # Advance state to build_review as if a build ran but the review session was interrupted
+    wf_path = run_dir / "workflow-state.json"
+    wf_data = json.loads(wf_path.read_text(encoding="utf-8"))
+    wf_data["stage"] = "build_review"
+    wf_path.write_text(json.dumps(wf_data, indent=2) + "\n", encoding="utf-8")
+
+    # Interactive build: gate prompt must NOT appear; completion report "4" → skip
+    _scripted_tty_stdin(monkeypatch, "4")
+    exit_build = main([*_config_args(tmp_path, config), "build", "--run-dir", str(run_dir)])
+    capsys.readouterr()
+    assert exit_build == 0

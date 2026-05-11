@@ -53,7 +53,7 @@ from .workflow import (
     run_clarification,
     run_planning,
 )
-from .workflow_state import WorkflowState, save_workflow_state
+from .workflow_state import WorkflowState, can_transition, save_workflow_state, transition_stage
 
 ProgressHook = Callable[..., None]
 _REPORT_MARKDOWN_FILENAME = "report.md"
@@ -95,7 +95,7 @@ def orchestrate_clarification(
             permission_mode=permission_mode,
             progress=progress,
         )
-        wf.stage = "plan_review"
+        transition_stage(wf, "plan_review")
         save_workflow_state(run.run_dir, wf)
         return run
 
@@ -131,7 +131,7 @@ def orchestrate_clarification(
         permission_mode=permission_mode,
         progress=progress,
     )
-    wf.stage = "plan_review"
+    transition_stage(wf, "plan_review")
     save_workflow_state(run.run_dir, wf)
     return run
 
@@ -220,7 +220,7 @@ def interactive_plan_review(
 
         accept_plan(run)
         wf.touch_accepted_plan()
-        wf.stage = "plan_review"
+        transition_stage(wf, "plan_review")
         save_workflow_state(run.run_dir, wf)
         return run
 
@@ -247,7 +247,7 @@ def resolve_build_permission(default_mode: str, session: InteractiveSession) -> 
     return session.prompt_choice(f"Choose builder permission mode (workspace default: {default_mode}):", choices)
 
 
-def interactive_build_review_loop(
+def interactive_build_review_loop(  # noqa: C901
     *,
     session: InteractiveSession,
     run: RunState,
@@ -260,6 +260,11 @@ def interactive_build_review_loop(
     """Return ``cancel`` when canceled; otherwise ``None``."""
     summary_path = run.run_dir / "08-build-review-summary.md"
     if not summary_path.exists():
+        return None
+    if session.non_interactive:
+        wf.build_review_selected_action = "continueWithoutApplying"
+        wf.build_review_selected_ids = []
+        save_workflow_state(run.run_dir, wf)
         return None
 
     while True:
@@ -321,26 +326,34 @@ def execute_build_through_completion(
     runs_root: Path,
 ) -> tuple[RunState, int]:
     """Run build, build-review loop, and completion reporting; return final run state and exit code."""
-    build_permission = permission_mode_cli or resolve_build_permission(execution.build_mode, session)
-    try:
-        run = run_build(
-            run,
-            router,
-            execution=execution,
-            permission_mode=build_permission,
-            progress=progress,
-            runs_root=runs_root,
-        )
-    except BuildFailedError as exc:
-        run = exc.run
-        wf.lifecycle_status = "failed"
-        save_workflow_state(run.run_dir, wf)
-        print(f"Build failed: {run.run_dir / '05-build-output.md'}")
-        print(f"Report: {run.run_dir / _REPORT_MARKDOWN_FILENAME}")
-        return run, 1
+    if wf.stage == "build_review":
+        # Resuming after an interrupted review session; skip re-running the build.
+        build_permission = permission_mode_cli or execution.build_mode
+    else:
+        build_permission = permission_mode_cli or resolve_build_permission(execution.build_mode, session)
+        try:
+            run = run_build(
+                run,
+                router,
+                execution=execution,
+                permission_mode=build_permission,
+                progress=progress,
+                runs_root=runs_root,
+            )
+        except BuildFailedError as exc:
+            run = exc.run
+            wf.lifecycle_status = "failed"
+            save_workflow_state(run.run_dir, wf)
+            print(f"Build failed: {run.run_dir / '05-build-output.md'}")
+            print(f"Report: {run.run_dir / _REPORT_MARKDOWN_FILENAME}")
+            return run, 1
 
-    wf.stage = "build_review"
-    save_workflow_state(run.run_dir, wf)
+        if can_transition(wf.stage, "build") and wf.stage != "build":
+            transition_stage(wf, "build")
+        if can_transition(wf.stage, "build_review") and wf.stage != "build_review":
+            transition_stage(wf, "build_review")
+        save_workflow_state(run.run_dir, wf)
+
     review_outcome = interactive_build_review_loop(
         session=session,
         run=run,
@@ -358,6 +371,10 @@ def execute_build_through_completion(
     if completion == "cancel":
         print(f"Report: {run.run_dir / _REPORT_MARKDOWN_FILENAME}")
         return run, 130
+
+    if can_transition(wf.stage, "complete"):
+        transition_stage(wf, "complete")
+        save_workflow_state(run.run_dir, wf)
 
     print(f"Build output: {run.run_dir / '05-build-output.md'}")
     print(f"Review summary: {run.run_dir / '08-build-review-summary.md'}")

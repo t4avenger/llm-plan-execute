@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import shutil
 import subprocess
+import threading
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 
 from .artifacts import write_state, write_text
@@ -365,6 +367,30 @@ def run_build(
     return existing
 
 
+_HEARTBEAT_INTERVAL_SECONDS = 30
+
+
+@contextmanager
+def _provider_heartbeat(progress: ProgressCallback | None, role: str, run: RunState, model: ModelInfo):  # type: ignore[misc]
+    """Emit heartbeat events on a background thread while a provider call runs."""
+    if not progress:
+        yield
+        return
+    stop_event = threading.Event()
+
+    def _loop() -> None:
+        while not stop_event.wait(timeout=_HEARTBEAT_INTERVAL_SECONDS):
+            progress("heartbeat", role, run, model, None, None)  # type: ignore[misc]
+
+    thread = threading.Thread(target=_loop, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        thread.join(timeout=1)
+
+
 def _run_provider(
     run: RunState,
     router: ProviderRouter,
@@ -377,13 +403,13 @@ def _run_provider(
     run.execution_policies[role] = execution_policy
     if progress:
         progress("start", role, run, model, None, None)
-    try:
-        result = router.run(role, model, prompt, execution_policy)
-    except Exception as exc:
-        if progress:
-            progress("finish", role, run, model, _failed_provider_result(role, model, prompt, exc), None)
-        raise
-    else:
+    with _provider_heartbeat(progress, role, run, model):
+        try:
+            result = router.run(role, model, prompt, execution_policy)
+        except Exception as exc:
+            if progress:
+                progress("finish", role, run, model, _failed_provider_result(role, model, prompt, exc), None)
+            raise
         if result.warning and result.warning not in run.warnings:
             run.warnings.append(result.warning)
         if progress:
