@@ -1,11 +1,14 @@
+import argparse
 import io
 import json
 import os
 from pathlib import Path
 
-from llm_plan_execute.cli import _state_from_json, main
+from llm_plan_execute.cli import ProgressReporter, _cmd_config, _format_elapsed, _state_from_json, main
 from llm_plan_execute.config import sample_config
-from llm_plan_execute.interactive import session_with_mock_stdin
+from llm_plan_execute.git_flow import GitFlowError
+from llm_plan_execute.interactive import InteractiveCanceledError, session_with_mock_stdin
+from llm_plan_execute.types import ModelInfo, ProviderActivity, ProviderResult, RunState, Usage
 from llm_plan_execute.workflow_state import workflow_lock_path
 
 CLARIFICATION_NEEDED_EXIT = 2
@@ -667,3 +670,90 @@ def test_build_resumes_at_build_review_stage_skips_gate(tmp_path, capsys, monkey
     exit_build = main([*_config_args(tmp_path, config), "build", "--run-dir", str(run_dir)])
     capsys.readouterr()
     assert exit_build == 0
+
+
+def test_main_interactive_canceled_returns_130(monkeypatch) -> None:
+    def boom(_argv: list[str] | None = None) -> int:
+        raise InteractiveCanceledError("canceled")
+
+    monkeypatch.setattr("llm_plan_execute.cli._run", boom)
+    assert main([]) == CANCELED_EXIT
+
+
+def test_main_git_flow_error_returns_1(monkeypatch, capsys) -> None:
+    def boom(_argv: list[str] | None = None) -> int:
+        raise GitFlowError("branch problem")
+
+    monkeypatch.setattr("llm_plan_execute.cli._run", boom)
+    assert main([]) == 1
+    assert "branch problem" in capsys.readouterr().err
+
+
+def test_cmd_config_unknown_subcommand_returns_one(tmp_path: Path) -> None:
+    args = argparse.Namespace(config_command="not-a-command", config=None, dry_run=True)
+    assert _cmd_config(args, tmp_path) == 1
+
+
+def test_format_elapsed_shows_minutes_for_long_durations() -> None:
+    assert "m" in _format_elapsed(125.0)
+    assert _format_elapsed(30.0).endswith("s")
+
+
+def test_progress_reporter_jsonl_activity_local_and_artifact(tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run = RunState.create("prompt", runs_root)
+    run.run_dir.mkdir(parents=True)
+    model = ModelInfo("cursor", "gpt", ("builder",))
+
+    buf = io.StringIO()
+    pr_json = ProgressReporter(enabled=True, verbose=True, stream=buf, ui="jsonl")
+    pr_json.update("start", "builder", run, model, None, None)
+    result = ProviderResult("builder", model, "p", "done", Usage(), 1.0, None)
+    pr_json.update("finish", "builder", run, model, result, None)
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    assert json.loads(lines[0])["status"] == "start"
+    assert json.loads(lines[-1])["status"] == "finish"
+
+    buf_plain = io.StringIO()
+    pr_plain = ProgressReporter(enabled=True, verbose=True, stream=buf_plain, ui="plain")
+    run._last_provider_activity = ProviderActivity(
+        role="builder",
+        model=model,
+        kind="file",
+        message="editing src/x.py",
+    )
+    pr_plain.update("activity", "builder", run, model, None, None)
+    assert "editing" in buf_plain.getvalue()
+
+    buf_local = io.StringIO()
+    pr_local = ProgressReporter(enabled=True, verbose=False, stream=buf_local, ui="plain")
+    run._last_local_progress = "preparing workspace"  # type: ignore[attr-defined]
+    pr_local.update("local", "workflow", run, None, None, None)
+    assert "preparing" in buf_local.getvalue()
+
+    artifact = run.run_dir / "artifact.md"
+    artifact.write_text("x", encoding="utf-8")
+    buf_art = io.StringIO()
+    pr_art = ProgressReporter(enabled=True, verbose=False, stream=buf_art, ui="plain")
+    pr_art.update("artifact", "builder", run, model, None, artifact)
+    assert "artifact.md" in buf_art.getvalue()
+
+
+def test_progress_reporter_heartbeat_and_verbose_error(tmp_path: Path, monkeypatch) -> None:
+    runs_root = tmp_path / "runs"
+    run = RunState.create("prompt", runs_root)
+    run.run_dir.mkdir(parents=True)
+    model = ModelInfo("cursor", "gpt", ("builder",))
+
+    buf = io.StringIO()
+    pr = ProgressReporter(enabled=True, verbose=True, stream=buf, ui="plain")
+    ticks = iter([100.0, 160.0, 190.0, 220.0])
+    monkeypatch.setattr("llm_plan_execute.cli.time.monotonic", lambda: next(ticks))
+
+    pr.update("start", "builder", run, model, None, None)
+    pr.update("heartbeat", "builder", run, model, None, None)
+    assert "waiting" in buf.getvalue()
+
+    err_result = ProviderResult("builder", model, "p", "bad", Usage(), 1.0, "exploded")
+    pr.update("finish", "builder", run, model, err_result, None)
+    assert "exploded" in buf.getvalue()
