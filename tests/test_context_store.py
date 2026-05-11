@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import builtins
-import fcntl
 import sqlite3
 import threading
 import time
@@ -63,13 +62,12 @@ def test_concurrent_writer_lock(tmp_path: Path) -> None:
     errors: list[BaseException] = []
 
     def first() -> None:
-        fh = store._acquire_writer_lock(blocking=True)
+        lock = store._acquire_writer_lock(blocking=True)
         try:
             barrier.wait()
             time.sleep(0.3)
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            fh.close()
+            lock.release()
 
     def second() -> None:
         barrier.wait()

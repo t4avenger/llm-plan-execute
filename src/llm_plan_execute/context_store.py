@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import importlib
 import json
 import math
@@ -15,6 +14,8 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from filelock import FileLock, Timeout
 
 from .context_types import ContextItem, EmbeddingRecord, HandoffPayload, SearchResult
 
@@ -164,23 +165,19 @@ class ContextStore:
     def _writer_lock_path(self) -> Path:
         return self.db_path.parent / ".context-write.lock"
 
-    def _acquire_writer_lock(self, *, blocking: bool = True) -> Any:
+    def _acquire_writer_lock(self, *, blocking: bool = True) -> FileLock:
         lock_path = self._writer_lock_path()
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        fh = open(lock_path, "a+", encoding="utf-8")  # noqa: SIM115 - manual lifecycle
-        flags = fcntl.LOCK_EX
-        if not blocking:
-            flags |= fcntl.LOCK_NB
+        lock = FileLock(str(lock_path))
         try:
-            fcntl.flock(fh.fileno(), flags)
-        except BlockingIOError as exc:
-            fh.close()
+            lock.acquire(blocking=blocking)
+        except Timeout as exc:
             raise ContextStoreLockedError("Context store is locked by another writer.") from exc
-        return fh
+        return lock
 
     def init(self) -> None:
         """Create database file and schema."""
-        fh = self._acquire_writer_lock()
+        lock = self._acquire_writer_lock()
         try:
             conn = self._connect()
             try:
@@ -188,8 +185,7 @@ class ContextStore:
             finally:
                 conn.close()
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            fh.close()
+            lock.release()
 
     def _init_schema(self, conn: sqlite3.Connection) -> None:
         conn.executescript(
@@ -273,7 +269,7 @@ class ContextStore:
         base_branch: str | None = None,
     ) -> None:
         now = _iso_now()
-        fh = self._acquire_writer_lock()
+        lock = self._acquire_writer_lock()
         try:
             conn = self._connect()
             try:
@@ -300,8 +296,7 @@ class ContextStore:
             finally:
                 conn.close()
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            fh.close()
+            lock.release()
 
     def add_context_item(
         self,
@@ -318,7 +313,7 @@ class ContextStore:
         safe = truncate_content(safe, self.max_content_bytes)
         meta = json.dumps(metadata, separators=(",", ":"), sort_keys=True)
         now = _iso_now()
-        fh = self._acquire_writer_lock()
+        lock = self._acquire_writer_lock()
         try:
             conn = self._connect()
             try:
@@ -348,8 +343,7 @@ class ContextStore:
             finally:
                 conn.close()
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            fh.close()
+            lock.release()
         return rid
 
     def add_handoff(
@@ -364,7 +358,7 @@ class ContextStore:
         hid = handoff_id or str(uuid.uuid4())
         body = json.dumps(asdict(payload), separators=(",", ":"), sort_keys=True)
         now = _iso_now()
-        fh = self._acquire_writer_lock()
+        lock = self._acquire_writer_lock()
         try:
             conn = self._connect()
             try:
@@ -389,8 +383,7 @@ class ContextStore:
             finally:
                 conn.close()
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            fh.close()
+            lock.release()
         return hid
 
     def _embedding_pairs(self, conn: sqlite3.Connection) -> list[tuple[str, str]]:
@@ -406,7 +399,7 @@ class ContextStore:
     ) -> None:
         """Create or replace embedding row for one context item."""
         model = model or DEFAULT_FASTEMBED_MODEL
-        fh = self._acquire_writer_lock()
+        lock = self._acquire_writer_lock()
         try:
             conn = self._connect()
             try:
@@ -441,15 +434,14 @@ class ContextStore:
             finally:
                 conn.close()
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            fh.close()
+            lock.release()
 
     def reindex_embeddings(self, *, task_id: str | None = None, model: str | None = None) -> int:
         """Recompute embeddings for items using the configured fastembed model."""
         model = model or DEFAULT_FASTEMBED_MODEL
         provider_name = DEFAULT_EMBEDDING_PROVIDER
         provider = _load_fastembed_provider(model)
-        fh = self._acquire_writer_lock()
+        lock = self._acquire_writer_lock()
         count = 0
         try:
             conn = self._connect()
@@ -479,8 +471,7 @@ class ContextStore:
             finally:
                 conn.close()
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            fh.close()
+            lock.release()
         return count
 
     def search_context(
@@ -495,7 +486,7 @@ class ContextStore:
         embedding_model: str | None = None,
     ) -> list[SearchResult]:
         embedding_model = embedding_model or DEFAULT_FASTEMBED_MODEL
-        fh = self._acquire_writer_lock(blocking=True)
+        lock = self._acquire_writer_lock(blocking=True)
         try:
             conn = self._connect()
             try:
@@ -519,8 +510,7 @@ class ContextStore:
             finally:
                 conn.close()
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            fh.close()
+            lock.release()
 
     def _row_to_item(self, row: sqlite3.Row) -> ContextItem:
         meta_raw = row["metadata_json"]
@@ -624,7 +614,7 @@ class ContextStore:
         return out
 
     def summarize_task(self, task_id: str, *, limit: int = 40) -> str:
-        fh = self._acquire_writer_lock()
+        lock = self._acquire_writer_lock()
         try:
             conn = self._connect()
             try:
@@ -641,8 +631,7 @@ class ContextStore:
             finally:
                 conn.close()
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            fh.close()
+            lock.release()
         lines = [f"# Task {task_id} summary", ""]
         for row in reversed(rows):
             lines.append(f"## {row['kind']} @ {row['created_at']}")
