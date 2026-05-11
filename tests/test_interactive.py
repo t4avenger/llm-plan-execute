@@ -157,6 +157,13 @@ def test_verbose_slash_command_without_callback():
     assert any("Verbose mode enabled" in line for line in stdout.lines)
 
 
+def test_verbose_slash_typo_is_rejected():
+    session, _stdout, stderr = session_with_mock_stdin(["/verbose onn", "1"])
+    result = session.ask_stage_transition()
+    assert result.type == "proceed"
+    assert any("Usage: /verbose on" in line for line in stderr.lines)
+
+
 def test_prompt_confirm_slash_cancel_raises():
     session, _stdout, _stderr = session_with_mock_stdin(["/cancel"])
     with pytest.raises(InteractiveCanceledError, match="Canceled from slash command"):

@@ -300,9 +300,17 @@ class InteractiveSession:
             return _simple[cmd]
         if cmd == "/retry" and include_retry:
             return "retry"
-        if cmd.startswith("/verbose "):
-            return self._set_verbose(cmd == "/verbose on")
+        if cmd.startswith("/verbose"):
+            return self._handle_verbose_command(cmd)
         self._println("Unknown slash command. Use /help.", stream=self._stderr)
+        return "unknown"
+
+    def _handle_verbose_command(self, cmd: str) -> str:
+        if cmd == "/verbose on":
+            return self._set_verbose(True)
+        if cmd == "/verbose off":
+            return self._set_verbose(False)
+        self._println("Usage: /verbose on | /verbose off", stream=self._stderr)
         return "unknown"
 
     def _set_verbose(self, enabled: bool) -> str:

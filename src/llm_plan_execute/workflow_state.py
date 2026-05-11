@@ -151,7 +151,7 @@ def acquire_workflow_lock(run_dir: Path, *, force: bool = False) -> Path | None:
     path = workflow_lock_path(run_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError as exc:
         stale = _is_lock_stale(path)
         if not stale and not force:
@@ -159,16 +159,19 @@ def acquire_workflow_lock(run_dir: Path, *, force: bool = False) -> Path | None:
                 f"Another active session is using {run_dir}. Use --force-session to override a stale lock."
             ) from exc
         path.unlink(missing_ok=True)
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError as exc2:
+            raise WorkflowStateLockError(
+                f"Another session grabbed {run_dir} during lock recovery. Use --force-session to override."
+            ) from exc2
     with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
         lock_file.write(str(os.getpid()) + "\n")
     return path
 
 
 def release_workflow_lock(run_dir: Path) -> None:
-    path = workflow_lock_path(run_dir)
-    if path.exists():
-        path.unlink()
+    workflow_lock_path(run_dir).unlink(missing_ok=True)
 
 
 def _read_stage(value: object) -> WorkflowStage:
