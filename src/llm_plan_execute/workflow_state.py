@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -18,12 +19,31 @@ WorkflowStage = Literal[
 ]
 
 WorkflowLifecycleStatus = Literal["active", "paused", "completed", "failed", "canceled"]
+CURRENT_WORKFLOW_SCHEMA_VERSION = 2
+WORKFLOW_STATE_LOCK_FILENAME = ".workflow-state.lock"
+
+
+class WorkflowStateError(ValueError):
+    """Base workflow-state persistence error."""
+
+
+class WorkflowStateVersionError(WorkflowStateError):
+    """Raised when reading an unsupported future schema."""
+
+
+class WorkflowStateCorruptError(WorkflowStateError):
+    """Raised when workflow-state.json is invalid JSON."""
+
+
+class WorkflowStateLockError(WorkflowStateError):
+    """Raised when another active session already holds the lock."""
 
 
 @dataclass
 class WorkflowState:
     """Contract for interactive workflow persistence under each run directory."""
 
+    schema_version: int = CURRENT_WORKFLOW_SCHEMA_VERSION
     stage: WorkflowStage = "clarification"
     lifecycle_status: WorkflowLifecycleStatus = "active"
     accepted_plan_version: int | None = None
@@ -47,7 +67,9 @@ class WorkflowState:
 
     @classmethod
     def from_json_dict(cls, raw: dict[str, Any]) -> WorkflowState:
+        schema_version = _read_schema_version(raw.get("schema_version"))
         return cls(
+            schema_version=schema_version,
             stage=_read_stage(raw.get("stage")),
             lifecycle_status=_read_lifecycle(raw.get("lifecycle_status")),
             accepted_plan_version=_optional_int(raw.get("accepted_plan_version")),
@@ -65,6 +87,15 @@ class WorkflowState:
 
 
 WORKFLOW_STATE_FILENAME = "workflow-state.json"
+_WORKFLOW_TRANSITIONS: dict[WorkflowStage, set[WorkflowStage]] = {
+    "clarification": {"planning", "plan_review"},
+    "planning": {"plan_review"},
+    "plan_review": {"pre_build"},
+    "pre_build": {"build"},
+    "build": {"build_review"},
+    "build_review": {"complete"},
+    "complete": set(),
+}
 
 
 def workflow_state_path(run_dir: Path) -> Path:
@@ -75,17 +106,69 @@ def load_workflow_state(run_dir: Path) -> WorkflowState:
     path = workflow_state_path(run_dir)
     if not path.exists():
         return WorkflowState()
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise WorkflowStateCorruptError(f"Corrupt workflow state at {path}: {exc}") from exc
     if not isinstance(raw, dict):
         return WorkflowState()
+    _check_supported_schema(raw)
     return WorkflowState.from_json_dict(raw)
 
 
 def save_workflow_state(run_dir: Path, state: WorkflowState) -> Path:
     path = workflow_state_path(run_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state.to_json_dict(), indent=2) + "\n", encoding="utf-8")
+    payload = state.to_json_dict()
+    payload["schema_version"] = CURRENT_WORKFLOW_SCHEMA_VERSION
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
     return path
+
+
+def workflow_lock_path(run_dir: Path) -> Path:
+    return run_dir / WORKFLOW_STATE_LOCK_FILENAME
+
+
+def _is_lock_stale(lock_path: Path) -> bool:
+    """Return True when the PID in the lock file is no longer running."""
+    try:
+        pid = int(lock_path.read_text(encoding="utf-8").strip())
+        if pid <= 0:
+            return True
+        os.kill(pid, 0)
+        return False  # process alive
+    except ProcessLookupError:
+        return True  # ESRCH: process gone
+    except PermissionError:
+        return False  # EPERM: process exists, we just can't signal it
+    except (ValueError, OSError):
+        return True  # unreadable / other error
+
+
+def acquire_workflow_lock(run_dir: Path, *, force: bool = False) -> Path | None:
+    path = workflow_lock_path(run_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        stale = _is_lock_stale(path)
+        if not stale and not force:
+            raise WorkflowStateLockError(
+                f"Another active session is using {run_dir}. Use --force-session to override a stale lock."
+            ) from exc
+        path.unlink(missing_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
+        lock_file.write(str(os.getpid()) + "\n")
+    return path
+
+
+def release_workflow_lock(run_dir: Path) -> None:
+    path = workflow_lock_path(run_dir)
+    if path.exists():
+        path.unlink()
 
 
 def _read_stage(value: object) -> WorkflowStage:
@@ -101,6 +184,39 @@ def _read_stage(value: object) -> WorkflowStage:
     if isinstance(value, str) and value in allowed:
         return value  # type: ignore[return-value]
     return "clarification"
+
+
+def _read_schema_version(value: object) -> int:
+    if value is None:
+        return CURRENT_WORKFLOW_SCHEMA_VERSION
+    if isinstance(value, int) and value > 0:
+        return value
+    return CURRENT_WORKFLOW_SCHEMA_VERSION
+
+
+def _check_supported_schema(raw: dict[str, Any]) -> None:
+    version = raw.get("schema_version")
+    if version is None:
+        return
+    if not isinstance(version, int):
+        raise WorkflowStateVersionError("workflow-state schema_version must be an integer.")
+    if version > CURRENT_WORKFLOW_SCHEMA_VERSION:
+        raise WorkflowStateVersionError(
+            f"workflow-state schema_version={version} is newer than supported "
+            f"version {CURRENT_WORKFLOW_SCHEMA_VERSION}."
+        )
+
+
+def can_transition(current: WorkflowStage, nxt: WorkflowStage) -> bool:
+    if current == nxt:
+        return True
+    return nxt in _WORKFLOW_TRANSITIONS[current]
+
+
+def transition_stage(state: WorkflowState, nxt: WorkflowStage) -> None:
+    if not can_transition(state.stage, nxt):
+        raise WorkflowStateError(f"Invalid workflow transition: {state.stage} -> {nxt}")
+    state.stage = nxt
 
 
 def _read_lifecycle(value: object) -> WorkflowLifecycleStatus:

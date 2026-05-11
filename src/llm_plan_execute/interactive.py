@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Generic, Literal, Protocol, TypeVar
 
@@ -13,6 +13,18 @@ T = TypeVar("T")
 
 DEFAULT_MAX_RETRIES = 5
 _CANCEL_WORKFLOW_LABEL = "Cancel workflow"
+_SLASH_HANDLED = object()  # sentinel: slash command consumed, caller should continue
+
+
+def _parse_confirm_token(token: str, default_yes: bool) -> bool | None:
+    """Return True/False for a recognised confirm response, None to keep prompting."""
+    if not token:
+        return default_yes
+    if token in {"y", "yes"}:
+        return True
+    if token in {"n", "no"}:
+        return False
+    return None
 
 
 class InteractiveCanceledError(Exception):
@@ -73,24 +85,26 @@ class InteractiveSession:
         stderr: SupportsWrite | None = None,
         non_interactive: bool = False,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        on_verbose_change: Callable[[bool], None] | None = None,
     ) -> None:
         self._stdin: SupportsReadline = stdin or sys.stdin
         self._stdout: SupportsWrite = stdout or sys.stdout
         self._stderr: SupportsWrite = stderr or sys.stderr
         self.non_interactive = non_interactive
         self.max_retries = max_retries
+        self._on_verbose_change = on_verbose_change
+        self._ctrl_c_pressed = False
 
-    def prompt_choice(self, question: str, options: Sequence[ChoiceOption[T]]) -> T:
+    def _print_choice_menu(self, question: str, options: Sequence[ChoiceOption[T]]) -> dict[str, T]:
         self._println(question, stream=self._stdout)
         for option in options:
             self._println(f"  {option.key}. {option.label}", stream=self._stdout)
-        choice_map = {option.key.strip().lower(): option.value for option in options}
+        return {option.key.strip().lower(): option.value for option in options}
 
+    def prompt_choice(self, question: str, options: Sequence[ChoiceOption[T]], *, include_retry: bool = False) -> T:
+        choice_map = self._print_choice_menu(question, options)
         if self.non_interactive:
-            default_key = options[0].key.strip().lower()
-            self._println(f"[non-interactive] defaulting to {default_key}", stream=self._stderr)
-            return choice_map[default_key]
-
+            raise InteractiveCanceledError("Prompt required in non-interactive mode.")
         for _attempt in range(self.max_retries):
             raw = self._read_line()
             if raw is None:
@@ -99,38 +113,41 @@ class InteractiveSession:
             if not token:
                 self._println("Please enter a choice.", stream=self._stderr)
                 continue
+            slash_value = self._resolve_slash_for_choice(token, options, include_retry=include_retry)
+            if slash_value is _SLASH_HANDLED:
+                continue
+            if slash_value is not None:
+                return slash_value  # type: ignore[return-value]
             if token in choice_map:
                 return choice_map[token]
             self._println(f"Invalid choice {raw!r}. Try again.", stream=self._stderr)
-
         raise InteractiveCanceledError("Exceeded maximum retries for menu input.")
 
     def prompt_confirm(self, question: str, *, default_yes: bool = False) -> bool:
         suffix = " [Y/n]" if default_yes else " [y/N]"
         self._println(question + suffix, stream=self._stdout)
         if self.non_interactive:
-            choice = default_yes
-            self._println(f"[non-interactive] default confirm={choice}", stream=self._stderr)
-            return choice
+            raise InteractiveCanceledError("Confirmation required in non-interactive mode.")
         for _attempt in range(self.max_retries):
             raw = self._read_line()
             if raw is None:
                 raise InteractiveCanceledError("EOF while confirming.")
             token = raw.strip().lower()
-            if token == "":
-                return default_yes
-            if token in {"y", "yes"}:
-                return True
-            if token in {"n", "no"}:
-                return False
+            slash = self._handle_slash_command(token, include_retry=False)
+            if slash in {"cancel", "exit"}:
+                raise InteractiveCanceledError("Canceled from slash command.")
+            if slash:
+                continue
+            result = _parse_confirm_token(token, default_yes)
+            if result is not None:
+                return result
             self._println("Please answer y or n.", stream=self._stderr)
         raise InteractiveCanceledError("Exceeded maximum retries for confirmation.")
 
     def prompt_free_text(self, question: str, *, required: bool = True) -> str:
         self._println(question, stream=self._stdout)
         if self.non_interactive:
-            self._println("[non-interactive] skipping free-text input.", stream=self._stderr)
-            return ""
+            raise InteractiveCanceledError("Free-text input required in non-interactive mode.")
         for attempt in range(self.max_retries):
             raw = self._read_line()
             if raw is None:
@@ -182,7 +199,7 @@ class InteractiveSession:
             ChoiceOption("3", "Step through plan", PlanReviewDecision(type="stepThrough")),
             ChoiceOption("4", _CANCEL_WORKFLOW_LABEL, PlanReviewDecision(type="cancel")),
         )
-        return self.prompt_choice("What would you like to do?", options)
+        return self.prompt_choice("What would you like to do?", options, include_retry=True)
 
     def ask_stage_transition(self) -> StageTransitionDecision:
         options = (
@@ -194,8 +211,7 @@ class InteractiveSession:
 
     def ask_build_review(self) -> BuildReviewDecision:
         if self.non_interactive:
-            self._println("[non-interactive] continuing without applying recommendations.", stream=self._stderr)
-            return BuildReviewDecision(type="continueWithoutApplying")
+            raise InteractiveCanceledError("Build review prompt required in non-interactive mode.")
         options = (
             ChoiceOption("1", "Apply all changes", BuildReviewDecision(type="applyAll")),
             ChoiceOption("2", "Select changes to apply", BuildReviewDecision(type="select")),
@@ -207,11 +223,14 @@ class InteractiveSession:
             ),
             ChoiceOption("5", _CANCEL_WORKFLOW_LABEL, BuildReviewDecision(type="cancel")),
         )
-        return self.prompt_choice("Review found recommended changes. What would you like to do?", options)
+        return self.prompt_choice(
+            "Review found recommended changes. What would you like to do?",
+            options,
+            include_retry=True,
+        )
 
     def ask_completion_report(self) -> CompletionReportDecision:
         if self.non_interactive:
-            self._println("[non-interactive] skipping completion report prompts.", stream=self._stderr)
             return CompletionReportDecision(type="skip")
         options = (
             ChoiceOption("1", "Print in terminal", CompletionReportDecision(type="terminal")),
@@ -228,8 +247,7 @@ class InteractiveSession:
             stream=self._stdout,
         )
         if self.non_interactive:
-            self._println("[non-interactive] applying none via selection.", stream=self._stderr)
-            return ()
+            raise InteractiveCanceledError("Selection required in non-interactive mode.")
         raw = self._read_line()
         if raw is None:
             raise InteractiveCanceledError("EOF during recommendation selection.")
@@ -244,15 +262,74 @@ class InteractiveSession:
     def _read_line(self) -> str | None:
         try:
             line = self._stdin.readline()
-        except KeyboardInterrupt as exc:
-            raise InteractiveCanceledError("Interrupted.") from exc
+        except KeyboardInterrupt:
+            if not self._ctrl_c_pressed:
+                self._ctrl_c_pressed = True
+                self._println("\nPress Ctrl+C again to cancel the workflow.", stream=self._stderr)
+                return ""
+            raise InteractiveCanceledError("Interrupted.") from None
         if line == "":
             return None
+        self._ctrl_c_pressed = False
         return line.rstrip("\n")
 
     def _println(self, text: str, *, stream: SupportsWrite) -> None:
         stream.write(text + "\n")
         stream.flush()
+
+    def _handle_slash_command(self, token: str, *, include_retry: bool) -> str | None:
+        if not token.startswith("/"):
+            return None
+        if token.startswith("//"):
+            self._println(f"Escaped slash input treated as data: {token[1:]}", stream=self._stderr)
+            return "escaped"
+        return self._dispatch_slash_command(token, include_retry=include_retry)
+
+    def _dispatch_slash_command(self, cmd: str, *, include_retry: bool) -> str:
+        if cmd == "/help":
+            self._println(
+                "Commands: /help, /status, /continue, /retry, /cancel, /verbose on, /verbose off, /exit",
+                stream=self._stdout,
+            )
+            return "help"
+        if cmd == "/status":
+            self._println("Session is idle and awaiting next action.", stream=self._stdout)
+            return "status"
+        _simple = {"/continue": "continue", "/cancel": "cancel", "/exit": "exit"}
+        if cmd in _simple:
+            return _simple[cmd]
+        if cmd == "/retry" and include_retry:
+            return "retry"
+        if cmd.startswith("/verbose "):
+            return self._set_verbose(cmd == "/verbose on")
+        self._println("Unknown slash command. Use /help.", stream=self._stderr)
+        return "unknown"
+
+    def _set_verbose(self, enabled: bool) -> str:
+        if self._on_verbose_change:
+            self._on_verbose_change(enabled)
+        label = "enabled" if enabled else "disabled"
+        self._println(f"Verbose mode {label} for this session.", stream=self._stdout)
+        return "verbose_on" if enabled else "verbose_off"
+
+    def _resolve_slash_for_choice(
+        self,
+        token: str,
+        options: Sequence[ChoiceOption[T]],
+        *,
+        include_retry: bool,
+    ) -> object:
+        """Return option value, _SLASH_HANDLED sentinel, or None (not a slash command)."""
+        slash = self._handle_slash_command(token, include_retry=include_retry)
+        if slash in {"cancel", "exit"}:
+            raise InteractiveCanceledError(f"Workflow {slash}ed.")
+        if slash == "continue":
+            return options[0].value
+        if slash == "retry":
+            return options[1].value if len(options) > 1 else options[0].value
+        if slash:
+            return _SLASH_HANDLED
+        return None
 
 
 class ListBuffer:

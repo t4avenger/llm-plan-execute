@@ -300,7 +300,7 @@ def test_execute_build_through_completion_exit_zero(monkeypatch, tmp_path: Path)
     run = RunState.create("prompt", runs_root)
     run.run_dir.mkdir(parents=True)
     run.accepted_plan = "plan body"
-    wf = WorkflowState()
+    wf = WorkflowState(stage="pre_build")  # valid precondition for execute_build_through_completion
 
     _, code = execute_build_through_completion(
         run=run,
@@ -313,7 +313,7 @@ def test_execute_build_through_completion_exit_zero(monkeypatch, tmp_path: Path)
         runs_root=runs_root,
     )
     assert code == 0
-    assert wf.stage == "build_review"
+    assert wf.stage == "complete"  # stage advances through build_review to complete
 
 
 def test_execute_build_through_completion_propagates_build_failed(monkeypatch, tmp_path: Path) -> None:

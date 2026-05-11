@@ -39,9 +39,9 @@ def test_prompt_free_text_required_retries_then_returns_text():
 
 def test_prompt_free_text_non_interactive_skips():
     session, _stdout, stderr = session_with_mock_stdin([], non_interactive=True)
-
-    assert session.read_build_feedback() == ""
-    assert any("skipping free-text" in line for line in stderr.lines)
+    with pytest.raises(InteractiveCanceledError, match="non-interactive mode"):
+        session.read_build_feedback()
+    assert stderr.lines == []
 
 
 def test_step_through_sections_next_stop_cancel_and_non_interactive():
@@ -70,6 +70,51 @@ def test_menu_helpers_return_typed_decisions_and_non_interactive_defaults():
     assert session.read_recommendation_selection(3) == ("2", "1")
 
     non_interactive, _stdout, _stderr = session_with_mock_stdin([], non_interactive=True)
-    assert non_interactive.ask_build_review().type == "continueWithoutApplying"
+    with pytest.raises(InteractiveCanceledError, match="non-interactive mode"):
+        non_interactive.ask_build_review()
     assert non_interactive.ask_completion_report().type == "skip"
-    assert non_interactive.read_recommendation_selection(3) == ()
+    with pytest.raises(InteractiveCanceledError, match="non-interactive mode"):
+        non_interactive.read_recommendation_selection(3)
+
+
+def test_slash_commands_and_escaped_input():
+    session, _stdout, stderr = session_with_mock_stdin(["/help", "/continue"])
+    assert session.ask_stage_transition().type == "proceed"
+
+    unknown, _stdout2, err2 = session_with_mock_stdin(["/wat", "1"])
+    assert unknown.ask_plan_review().type == "accept"
+    assert any("Unknown slash command" in line for line in err2.lines)
+
+    escaped, _stdout3, err3 = session_with_mock_stdin(["//status", "1"])
+    assert escaped.ask_plan_review().type == "accept"
+    assert any("Escaped slash input treated as data" in line for line in err3.lines)
+
+
+def test_ctrl_c_first_press_warns_second_cancels():
+    """First Ctrl-C warns; second Ctrl-C raises InteractiveCanceledError."""
+    from llm_plan_execute.interactive import InteractiveSession, ListBuffer
+
+    class _CtrlCThenValidStdin:
+        def __init__(self, responses):
+            self._iter = iter(responses)
+
+        def readline(self) -> str:
+            value = next(self._iter)
+            if value is KeyboardInterrupt:
+                raise KeyboardInterrupt
+            return value + "\n"
+
+    # First Ctrl-C → warning printed, then valid input "1" → proceed
+    stdin = _CtrlCThenValidStdin([KeyboardInterrupt, "1"])
+    stdout = ListBuffer()
+    stderr = ListBuffer()
+    session = InteractiveSession(stdin=stdin, stdout=stdout, stderr=stderr)
+    result = session.ask_stage_transition()
+    assert result.type == "proceed"
+    assert any("Ctrl+C again" in line for line in stderr.lines)
+
+    # Two consecutive Ctrl-Cs → InteractiveCanceledError
+    stdin2 = _CtrlCThenValidStdin([KeyboardInterrupt, KeyboardInterrupt])
+    session2 = InteractiveSession(stdin=stdin2, stdout=ListBuffer(), stderr=ListBuffer())
+    with pytest.raises(InteractiveCanceledError, match="Interrupted"):
+        session2.ask_stage_transition()
