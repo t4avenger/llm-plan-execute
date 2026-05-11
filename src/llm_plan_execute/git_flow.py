@@ -11,7 +11,8 @@ from typing import Any
 
 from .workflow_state import WorkflowState
 
-RUNS_DIR_SEGMENT = ".llm-plan-execute/runs"
+WORKSPACE_META_DIR = ".llm-plan-execute"
+RUNS_DIR_SEGMENT = f"{WORKSPACE_META_DIR}/runs"
 _PR_BODY_FILL_IN_LINE = "- (fill in)"
 
 
@@ -169,7 +170,7 @@ def filter_checkpoint_pathspecs(
 
 
 def _checkpoint_excluded_roots(repo_root: Path, extra: list[Path] | None) -> list[Path]:
-    roots = [(repo_root / ".llm-plan-execute" / "runs").resolve()]
+    roots = [(repo_root / WORKSPACE_META_DIR / "runs").resolve()]
     for path in extra or []:
         roots.append(path.resolve() if path.is_absolute() else (repo_root / path).resolve())
     return roots
@@ -468,7 +469,7 @@ def _interactive_user_accepts_pr_prompt() -> bool:
 
 def _try_github_pr_or_write_fallback(workspace: Path, repo: Path, pr_title: str, body: str) -> None:
     """Create PR via gh when possible; otherwise write pr-body.md with diagnostics."""
-    out_path = workspace / ".llm-plan-execute" / "pr-body.md"
+    out_path = workspace / WORKSPACE_META_DIR / "pr-body.md"
     ok_auth, auth_reason = gh_available_and_authenticated()
     if not ok_auth:
         write_text_report(out_path, body)
@@ -505,7 +506,7 @@ def maybe_offer_github_pr(
 
     pr_title = title_hint.strip().splitlines()[0][:120] if title_hint.strip() else f"Task {task_id}"
 
-    out_path = workspace / ".llm-plan-execute" / "pr-body.md"
+    out_path = workspace / WORKSPACE_META_DIR / "pr-body.md"
 
     if repo is None:
         write_text_report(out_path, body)
