@@ -59,7 +59,7 @@ The CLI separates **installed application code** from the **workspace** you are 
 Run artifacts under the configured `runs_dir` are excluded from git-based workspace change detection so generated files do not look like user edits.
 
 Provider configs live at `.llm-plan-execute/config.json` (relative to the chosen workspace) and are intentionally local.
-`init-config` enables provider entries whose configured command is found on `PATH` and disables missing commands. For example, a machine with `codex` and `cursor-agent` installed will enable Codex and Cursor, while leaving Claude disabled if `claude` is absent. Cursor's default model is builder-only unless you explicitly add planning or review roles.
+`init-config` writes default model entries for Codex, Claude, and Cursor, then enables only provider entries whose configured command is found on `PATH`. For example, a machine with `codex` and `cursor-agent` installed will enable Codex and Cursor, while leaving Claude disabled if `claude` is absent. Cursor's default model is builder-only unless you explicitly add planning or review roles.
 
 Normal CLI usage requires a config file. If `.llm-plan-execute/config.json` is missing, commands such as `models`, `run`, `plan`, and `build` fail with guidance to run `init-config`, pass `--config`, or opt into `--dry-run`.
 
@@ -118,15 +118,62 @@ The real-provider path uses explicit adapters for each supported CLI:
       "name": "claude",
       "command": "claude",
       "enabled": false,
-      "models": []
+      "models": [
+        {
+          "name": "opus",
+          "roles": ["plan_reviewer_b", "build_reviewer_b"],
+          "reasoning": 5,
+          "speed": 3,
+          "cost": 5,
+          "context": 5,
+          "exact_usage": false
+        },
+        {
+          "name": "sonnet",
+          "roles": ["builder", "plan_reviewer_a", "build_reviewer_a"],
+          "reasoning": 4,
+          "speed": 4,
+          "cost": 3,
+          "context": 5,
+          "exact_usage": false
+        }
+      ]
     }
   ]
 }
 ```
 
+### Claude Code CLI
+
+**Binary discovery:** The orchestrator resolves provider executables with `shutil.which()` on the string in each provider’s `"command"` field (for example `"claude"`). That follows the normal **`PATH`** lookup rules for your environment unless you use an absolute path. `init-config` sets `"enabled": true` for Claude in the generated sample only when `shutil.which("claude")` succeeds for the default command name. There is no separate environment-variable override in this codebase; change `"command"` in `.llm-plan-execute/config.json` if you need a different binary name or path.
+
+**Invocation contract:** Implemented in [`src/llm_plan_execute/providers.py`](src/llm_plan_execute/providers.py): `ClaudeAdapter` builds argv `[command, "--model", <model>, <prompt>]` and `CLIProvider` runs it via `subprocess.run` with `cwd` set to the resolved workspace, `capture_output=True`, `text=True`, `check=False`, and a **30-minute** per-call timeout. Provider subprocesses inherit the parent process environment; there is no per-provider environment block in config. Exit codes and stderr are normalized into run reports; subprocess failures (including timeouts) become readable `ProviderResult.error` text.
+
+**Prerequisites:** Install the Claude Code CLI from Anthropic’s published instructions so the `claude` executable is available the same way your shell would run it. Complete provider authentication in Claude’s own tooling; this project does not manage API keys for provider CLIs.
+
+Optional local sanity checks:
+
+```bash
+claude --version
+claude --help
+```
+
+Keep Claude disabled in config until you intend to run it live; workflow steps that select a Claude model will shell out and may block on auth or interactive prompts.
+
+Minimal manual smoke path:
+
+```bash
+uv run llm-plan-execute init-config
+uv run llm-plan-execute config validate
+uv run llm-plan-execute models
+uv run llm-plan-execute plan --prompt "Smoke test Claude provider startup" --permission-mode read-only
+```
+
+Before the final `plan` command, edit `.llm-plan-execute/config.json` only if `init-config` disabled Claude or if you want to change the default Claude model names or role eligibility. The smoke succeeds when the run report shows a Claude model assignment and either provider output or a Claude-auth/runtime error from the spawned CLI.
+
 Execution permissions are passed to provider CLIs for every model call. By default, planning and review calls use `read-only`, while the builder uses `workspace-write`. Override a command with `--permission-mode read-only|workspace-write|full-access`, and add extra writable locations with repeated `--writable-dir <path>`.
 
-Codex is invoked as `codex exec --model <model> --sandbox <mode> --cd <workspace> <prompt>` for normal modes, with `full-access` mapped to `--dangerously-bypass-approvals-and-sandbox`. Cursor Agent is invoked as `cursor-agent --print --output-format text --model <model> --workspace <workspace> --trust <prompt>`; `read-only` adds `--mode plan`, and `full-access` adds `--force --sandbox disabled`. If Cursor reports that sandbox mode is enabled but unavailable on the local system, the CLI retries once without Cursor sandbox flags and records a warning in the run report. Claude remains a documented extension point, but it should stay disabled unless the `claude` command is installed and an adapter has been validated for the local CLI version.
+Codex is invoked as `codex exec --model <model> --sandbox <mode> --cd <workspace> <prompt>` for normal modes, with `full-access` mapped to `--dangerously-bypass-approvals-and-sandbox`. Cursor Agent is invoked as `cursor-agent --print --output-format text --model <model> --workspace <workspace> --trust <prompt>`; `read-only` adds `--mode plan`, and `full-access` adds `--force --sandbox disabled`. If Cursor reports that sandbox mode is enabled but unavailable on the local system, the CLI retries once without Cursor sandbox flags and records a warning in the run report. Claude is invoked as `claude --model <model> <prompt>` from the workspace directory when a Claude model is selected and the configured command resolves successfully.
 
 Common failure modes:
 
@@ -181,11 +228,11 @@ The skills are optional. The CLI works directly from a terminal without any agen
 
 ## Production Readiness
 
-The current implementation is provider-ready for local Codex and Cursor Agent execution with estimated usage reporting:
+The current implementation is provider-ready for local Codex and Cursor Agent execution with estimated usage reporting; Claude Code is wired through the same adapter layer when enabled in config.
 
 - `llm-plan-execute` CLI supports `init-config`, `models`, `run`, `plan`, `accept`, `build`, and `report`.
 - Dry-run providers allow the full workflow to run without live provider calls.
-- Provider-specific CLI adapters are in place for Codex and Cursor Agent.
+- Provider-specific CLI adapters are in place for Codex, Cursor Agent, and Claude Code (`claude`).
 - Config validation checks provider names, roles, score ranges, duplicate model ids, shape errors, and provider command availability.
 - Model assignment uses deterministic role scoring with diversity fallback warnings.
 - Run artifacts are written as Markdown and JSON under `.llm-plan-execute/runs/`.
@@ -196,9 +243,9 @@ Known follow-ups:
 
 - Add exact usage parsing per provider when CLIs expose structured usage.
 - Add structured JSON output mode for provider calls where available.
-- Add release workflow and versioning policy.
+- Add release workflow and version automation.
 - Add Dependabot or Renovate for pinned actions and Python tooling.
-- Add a security policy, contribution guide, and changelog once external contributors are expected.
+- Add a security policy and contribution guide once external contributors are expected.
 - Add real integration tests gated behind opt-in environment variables for authenticated provider CLIs.
 
 ## Architecture Decisions
@@ -206,6 +253,23 @@ Known follow-ups:
 Architecture decisions are recorded in [docs/adr](docs/adr/README.md). Add a new ADR whenever a decision changes dependencies, provider boundaries, workflow behavior, security posture, or long-term maintenance expectations.
 
 ## Development
+
+### Versioning
+
+The canonical package version is `project.version` in [`pyproject.toml`](pyproject.toml). **Minor** releases increment the middle component and reset the patch to **0** (for example `0.1.0` → `0.2.0`). Keep these mirrors aligned:
+
+| Location | Role |
+| -------- | ---- |
+| [`pyproject.toml`](pyproject.toml) | Single source of truth |
+| [`src/llm_plan_execute/__init__.py`](src/llm_plan_execute/__init__.py) | Runtime `__version__` |
+| [`uv.lock`](uv.lock) | Workspace package entry for `llm-plan-execute` |
+
+[`tests/test_version_sync.py`](tests/test_version_sync.py) asserts the three match. After changing the version in `pyproject.toml`, run `uv lock` so the lockfile updates.
+
+### Automated vs manual checks
+
+- **Automated (hermetic):** unit tests mock provider subprocesses and do not require Codex, Cursor, Claude, or credentials. Use the commands below in CI and before commits.
+- **Manual (optional):** verify real CLIs (`claude --version`, `claude --help`, and analogous commands for other providers) and, when exploring live execution, run workflow commands from a workspace whose `.llm-plan-execute/config.json` enables the provider you want. Live runs may fail for auth, quotas, or prompts; resolution of the binary and process start is still the supported integration boundary.
 
 Use `uv` for the local environment:
 
