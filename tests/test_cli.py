@@ -612,3 +612,24 @@ def test_build_without_force_session_fails_on_live_lock(tmp_path, capsys):
     captured = capsys.readouterr()
     assert exit_build == 1
     assert "--force-session" in captured.err
+
+
+def test_build_resumes_at_build_review_stage_skips_gate(tmp_path, capsys, monkeypatch):
+    """When workflow-state stage is already build_review, the pre-build gate is bypassed."""
+    config = _write_dry_config(tmp_path)
+    main([*_config_args(tmp_path, config), "plan", "--prompt", "Add feature", "--no-clarify", "--yes"])
+    captured = capsys.readouterr()
+    run_line = next(line for line in captured.out.splitlines() if line.startswith("Run:"))
+    run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
+
+    # Advance state to build_review as if a build ran but the review session was interrupted
+    wf_path = run_dir / "workflow-state.json"
+    wf_data = json.loads(wf_path.read_text(encoding="utf-8"))
+    wf_data["stage"] = "build_review"
+    wf_path.write_text(json.dumps(wf_data, indent=2) + "\n", encoding="utf-8")
+
+    # Interactive build: gate prompt must NOT appear; completion report "4" → skip
+    _scripted_tty_stdin(monkeypatch, "4")
+    exit_build = main([*_config_args(tmp_path, config), "build", "--run-dir", str(run_dir)])
+    capsys.readouterr()
+    assert exit_build == 0

@@ -88,3 +88,35 @@ def test_lock_error_message_references_force_session(tmp_path):
     with pytest.raises(WorkflowStateLockError, match="--force-session"):
         acquire_workflow_lock(tmp_path)
     release_workflow_lock(tmp_path)
+
+
+def test_is_lock_stale_process_lookup_error_clears_lock(tmp_path, monkeypatch):
+    """A lock whose PID raises ProcessLookupError (ESRCH) is treated as stale."""
+    lock_path = workflow_lock_path(tmp_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text("99999\n", encoding="utf-8")
+
+    def fake_kill(_pid, _sig):
+        raise ProcessLookupError("no such process")
+
+    monkeypatch.setattr("llm_plan_execute.workflow_state.os.kill", fake_kill)
+
+    acquire_workflow_lock(tmp_path)
+    assert int(lock_path.read_text(encoding="utf-8").strip()) == os.getpid()
+    release_workflow_lock(tmp_path)
+
+
+def test_is_lock_stale_permission_error_treats_lock_as_live(tmp_path, monkeypatch):
+    """A lock whose PID raises PermissionError (EPERM) is treated as a live process."""
+    lock_path = workflow_lock_path(tmp_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text("99999\n", encoding="utf-8")
+
+    def fake_kill(_pid, _sig):
+        raise PermissionError("operation not permitted")
+
+    monkeypatch.setattr("llm_plan_execute.workflow_state.os.kill", fake_kill)
+
+    with pytest.raises(WorkflowStateLockError):
+        acquire_workflow_lock(tmp_path)
+    assert lock_path.read_text(encoding="utf-8").strip() == "99999"
