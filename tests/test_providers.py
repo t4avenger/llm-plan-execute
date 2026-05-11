@@ -13,6 +13,9 @@ from llm_plan_execute.providers import (
 )
 from llm_plan_execute.types import ExecutionPolicy, ModelInfo, ProviderResult, Usage
 
+# Mirrors llm_plan_execute.providers._run_provider_command timeout=...
+_PROVIDER_RUN_TIMEOUT_SEC = 1800
+
 
 def test_cli_provider_captures_nonzero_exit_code(monkeypatch):
     model = ModelInfo("codex", "model")
@@ -183,6 +186,79 @@ def test_claude_adapter_builds_documented_extension_command():
     assert command.cwd == workspace.resolve()
 
 
+def test_claude_provider_invokes_subprocess_with_documented_contract(monkeypatch, tmp_path):
+    """Spawning uses subprocess.run with cwd, capture_output, timeout (owned error boundary)."""
+    model = ModelInfo("claude", "opus")
+    provider = CLIProvider(
+        ProviderConfig("claude", "claude", True, (model,)),
+        workspace=tmp_path,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("llm_plan_execute.providers.shutil.which", lambda command: f"/fake/{command}")
+    monkeypatch.setattr("llm_plan_execute.providers.subprocess.run", fake_run)
+
+    result = provider.run("plan_reviewer_b", model, "review this plan", ExecutionPolicy())
+
+    assert result.error is None
+    assert captured["cmd"] == ["claude", "--model", "opus", "review this plan"]
+    kwargs = captured["kwargs"]
+    assert kwargs["cwd"] == tmp_path.resolve()
+    assert kwargs["timeout"] == _PROVIDER_RUN_TIMEOUT_SEC
+    assert kwargs["text"] is True
+    assert kwargs["capture_output"] is True
+    assert kwargs["check"] is False
+
+
+def test_claude_provider_maps_subprocess_timeout(monkeypatch):
+    model = ModelInfo("claude", "sonnet")
+    provider = CLIProvider(ProviderConfig("claude", "claude", True, (model,)))
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        cmd = args[0] if args else []
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=int(kwargs.get("timeout", 0)))
+
+    monkeypatch.setattr("llm_plan_execute.providers.shutil.which", lambda command: f"/bin/{command}")
+    monkeypatch.setattr("llm_plan_execute.providers.subprocess.run", fake_run)
+
+    result = provider.run("builder", model, "prompt")
+
+    assert "timed out" in result.error
+
+
+def test_claude_provider_captures_nonzero_exit_code_and_stderr(monkeypatch):
+    model = ModelInfo("claude", "sonnet")
+    provider = CLIProvider(ProviderConfig("claude", "claude", True, (model,)))
+
+    def fake_run(*args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args[0], 7, stdout="", stderr="auth required")
+
+    monkeypatch.setattr("llm_plan_execute.providers.shutil.which", lambda command: f"/bin/{command}")
+    monkeypatch.setattr("llm_plan_execute.providers.subprocess.run", fake_run)
+
+    result = provider.run("builder", model, "prompt")
+
+    assert result.error == "Provider exited with code 7: auth required"
+    assert result.output == "Provider returned no stdout. stderr:\nauth required"
+
+
+def test_claude_provider_reports_unresolved_command(monkeypatch):
+    model = ModelInfo("claude", "sonnet")
+    provider = CLIProvider(ProviderConfig("claude", "claude", True, (model,)))
+
+    monkeypatch.setattr("llm_plan_execute.providers.shutil.which", lambda _command: None)
+
+    result = provider.run("builder", model, "prompt")
+
+    assert result.error == "Provider command 'claude' could not be resolved."
+    assert result.output == result.error
+
+
 def test_cli_provider_reports_missing_command(monkeypatch):
     model = ModelInfo("codex", "gpt-5.4")
     provider = CLIProvider(ProviderConfig("codex", "missing-codex", True, (model,)))
@@ -191,7 +267,7 @@ def test_cli_provider_reports_missing_command(monkeypatch):
 
     result = provider.run("planner", model, "prompt")
 
-    assert result.error == "Provider command 'missing-codex' is not available on PATH."
+    assert result.error == "Provider command 'missing-codex' could not be resolved."
     assert result.output == result.error
 
 

@@ -204,7 +204,7 @@ class CLIProvider(Provider):
             usage.cost_usd = estimate_cost(model, usage)
             return ProviderResult(role, model, prompt, output, usage, time.monotonic() - start, output)
         if shutil.which(self.config.command) is None:
-            error = f"Provider command {self.config.command!r} is not available on PATH."
+            error = f"Provider command {self.config.command!r} could not be resolved."
             usage.output_tokens = estimate_tokens(error)
             usage.cost_usd = estimate_cost(model, usage)
             return ProviderResult(role, model, prompt, error, usage, time.monotonic() - start, error)
