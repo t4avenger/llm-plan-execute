@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import types
 from pathlib import Path
 
 from llm_plan_execute.context_cli import run_context_command
@@ -56,3 +57,28 @@ def test_context_cli_reports_errors(tmp_path: Path, capsys) -> None:
 
 def test_context_cli_unknown_command_returns_one(tmp_path: Path) -> None:
     assert run_context_command(_args("unknown"), tmp_path) == 1
+
+
+def test_context_cli_reindex_embeds_items(monkeypatch, tmp_path: Path, capsys) -> None:
+    """Covers context ``reindex`` command (fastembed path mocked)."""
+
+    class FakeTextEmbedding:
+        def __init__(self, model_name: str) -> None:
+            self.model_name = model_name
+
+        def embed(self, texts):
+            for _text in texts:
+                yield [0.1, 0.2]
+
+    fake_module = types.SimpleNamespace(TextEmbedding=FakeTextEmbedding)
+    monkeypatch.setattr("llm_plan_execute.context_store.importlib.import_module", lambda _name: fake_module)
+
+    assert run_context_command(_args("init"), tmp_path) == 0
+    monkeypatch.setattr("sys.stdin", io.StringIO("embed me"))
+    assert run_context_command(_args("add", task="t1", kind="note", path=None, stdin=True, file=None), tmp_path) == 0
+    capsys.readouterr()
+
+    assert run_context_command(_args("reindex", task=None), tmp_path) == 0
+    out = capsys.readouterr().out
+    assert "Reindexed" in out
+    assert "item" in out.lower()
