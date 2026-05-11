@@ -10,6 +10,7 @@ from .types import PERMISSION_MODES, ROLES, ExecutionPolicy, ModelInfo
 
 DEFAULT_ROOT = Path(".llm-plan-execute")
 DEFAULT_CONFIG = DEFAULT_ROOT / "config.json"
+_MSG_JSON_VALUE_MUST_BE_OBJECT = "must be an object"
 SUPPORTED_PROVIDERS = frozenset({"codex", "cursor", "claude"})
 SCORE_FIELDS = ("reasoning", "speed", "cost", "context")
 MIN_SCORE = 1
@@ -402,7 +403,7 @@ def _validate_execution(raw: object, errors: list[ConfigIssue]) -> None:
     if raw in ({}, None):
         return
     if not isinstance(raw, dict):
-        errors.append(ConfigIssue("error", "execution", "must be an object"))
+        errors.append(ConfigIssue("error", "execution", _MSG_JSON_VALUE_MUST_BE_OBJECT))
         return
     _validate_permission_mode("execution.default_mode", raw.get("default_mode", "workspace-write"), errors)
     _validate_execution_phases(raw.get("phases", {}), errors)
@@ -411,7 +412,7 @@ def _validate_execution(raw: object, errors: list[ConfigIssue]) -> None:
 
 def _validate_execution_phases(phases: object, errors: list[ConfigIssue]) -> None:
     if not isinstance(phases, dict):
-        errors.append(ConfigIssue("error", "execution.phases", "must be an object"))
+        errors.append(ConfigIssue("error", "execution.phases", _MSG_JSON_VALUE_MUST_BE_OBJECT))
         return
     for phase in ("planning", "review", "build"):
         if phase in phases:
@@ -422,7 +423,7 @@ def _validate_build(raw: object, errors: list[ConfigIssue]) -> None:
     if raw in (None, {}):
         return
     if not isinstance(raw, dict):
-        errors.append(ConfigIssue("error", "build", "must be an object"))
+        errors.append(ConfigIssue("error", "build", _MSG_JSON_VALUE_MUST_BE_OBJECT))
         return
     if "base_branch" in raw and raw["base_branch"] is not None and not isinstance(raw["base_branch"], str):
         errors.append(ConfigIssue("error", "build.base_branch", "must be a string or null"))

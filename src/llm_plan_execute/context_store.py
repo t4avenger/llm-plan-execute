@@ -22,6 +22,7 @@ from .context_types import ContextItem, EmbeddingRecord, HandoffPayload, SearchR
 CONTEXT_SQLITE_INTERNAL_VERSION = 1
 DEFAULT_MAX_CONTENT_BYTES = 64 * 1024
 TRUNCATION_MARKER = "\n\n[truncated by llm-plan-execute]\n"
+_SQL_BEGIN_IMMEDIATE = "BEGIN IMMEDIATE"
 
 DEFAULT_EMBEDDING_PROVIDER = "fastembed"
 DEFAULT_FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
@@ -134,7 +135,7 @@ def _load_fastembed_provider(model: str) -> Any:
             first = vectors[0]
             if hasattr(first, "tolist"):
                 return [float(x) for x in first.tolist()]
-            return [float(x) for x in list(first)]
+            return [float(x) for x in first]
 
     return _FastEmbedWrapper(model)
 
@@ -274,7 +275,7 @@ class ContextStore:
             conn = self._connect()
             try:
                 self._init_schema(conn)
-                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(_SQL_BEGIN_IMMEDIATE)
                 row = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
                 if row:
                     conn.execute(
@@ -318,7 +319,7 @@ class ContextStore:
             conn = self._connect()
             try:
                 self._init_schema(conn)
-                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(_SQL_BEGIN_IMMEDIATE)
                 if task_id:
                     conn.execute(
                         """
@@ -363,7 +364,7 @@ class ContextStore:
             conn = self._connect()
             try:
                 self._init_schema(conn)
-                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(_SQL_BEGIN_IMMEDIATE)
                 conn.execute(
                     """
                     INSERT INTO tasks(id, title, branch, base_branch, status, created_at, updated_at)
@@ -418,7 +419,7 @@ class ContextStore:
                 blob = _vec_to_blob(vec)
                 dim = len(vec)
                 now = _iso_now()
-                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(_SQL_BEGIN_IMMEDIATE)
                 conn.execute(
                     """
                     INSERT INTO embeddings(context_item_id, provider, model, dim, vector_blob, created_at)
@@ -447,7 +448,7 @@ class ContextStore:
             conn = self._connect()
             try:
                 self._init_schema(conn)
-                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(_SQL_BEGIN_IMMEDIATE)
                 conn.execute("DELETE FROM embeddings")
                 sql = "SELECT id, content FROM context_items"
                 params: tuple[Any, ...] = ()

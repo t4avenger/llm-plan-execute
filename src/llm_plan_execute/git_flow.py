@@ -12,6 +12,7 @@ from typing import Any
 from .workflow_state import WorkflowState
 
 RUNS_DIR_SEGMENT = ".llm-plan-execute/runs"
+_PR_BODY_FILL_IN_LINE = "- (fill in)"
 
 
 class GitFlowError(RuntimeError):
@@ -158,7 +159,7 @@ def filter_checkpoint_pathspecs(
         if not ps or ps.strip() == "":
             continue
         norm = ps.replace("\\", "/").strip()
-        if RUNS_DIR_SEGMENT in norm or norm.startswith(".llm-plan-execute/runs"):
+        if RUNS_DIR_SEGMENT in norm or norm.startswith(RUNS_DIR_SEGMENT):
             continue
         target = (repo_root / norm).resolve()
         if _is_under_any(target, excluded):
@@ -306,7 +307,7 @@ def commit_checkpoint(
 
     filtered = filter_checkpoint_pathspecs(repo_root.resolve(), pathspecs, excluded_roots=excluded_roots)
     if not filtered:
-        return CommitResult(False, None, "no pathspecs after excluding .llm-plan-execute/runs/")
+        return CommitResult(False, None, f"no pathspecs after excluding {RUNS_DIR_SEGMENT}/")
 
     repo_root = repo_root.resolve()
     add_proc = subprocess.run([git, "add", "--", *filtered], cwd=repo_root, capture_output=True, text=True, check=False)  # noqa: S603
@@ -364,9 +365,7 @@ def list_tracked_pathspecs(repo_root: Path, *, exclude_runs: bool = True) -> lis
     paths = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
     if not exclude_runs:
         return paths
-    return [
-        p for p in paths if RUNS_DIR_SEGMENT not in p.replace("\\", "/") and not p.startswith(".llm-plan-execute/runs")
-    ]
+    return [p for p in paths if RUNS_DIR_SEGMENT not in p.replace("\\", "/") and not p.startswith(RUNS_DIR_SEGMENT)]
 
 
 def git_changed_pathspecs(repo_root: Path, *, excluded_roots: list[Path] | None = None) -> list[str]:
@@ -387,8 +386,6 @@ def git_changed_pathspecs(repo_root: Path, *, excluded_roots: list[Path] | None 
     filtered = []
     for p in sorted(names):
         if RUNS_DIR_SEGMENT in p.replace("\\", "/"):
-            continue
-        if ".llm-plan-execute/runs" in p.replace("\\", "/"):
             continue
         if _is_under_any((repo_root / p).resolve(), excluded):
             continue
@@ -429,18 +426,19 @@ def try_github_pr_create(repo_root: Path, title: str, body: str) -> tuple[bool, 
 
 def build_pr_body(task_id: str) -> str:
     """Markdown PR body scaffold including sections required by the workflow."""
+    fill = _PR_BODY_FILL_IN_LINE
     lines = [
         "## Summary",
         "",
-        "- (fill in)",
+        fill,
         "",
         "## Implementation notes",
         "",
-        "- (fill in)",
+        fill,
         "",
         "## Tests run",
         "",
-        "- (fill in)",
+        fill,
         "",
         "## Commit list",
         "",
@@ -453,13 +451,40 @@ def build_pr_body(task_id: str) -> str:
         "",
         "## Known limitations",
         "",
-        "- (fill in)",
+        fill,
         "",
     ]
     return "\n".join(lines)
 
 
-def maybe_offer_github_pr(  # noqa: C901
+def _interactive_user_accepts_pr_prompt() -> bool:
+    print("Build review is complete. Create a PR? [y/N]", flush=True)
+    try:
+        answer = input().strip().lower()
+    except EOFError:
+        answer = ""
+    return answer in {"y", "yes"}
+
+
+def _try_github_pr_or_write_fallback(workspace: Path, repo: Path, pr_title: str, body: str) -> None:
+    """Create PR via gh when possible; otherwise write pr-body.md with diagnostics."""
+    out_path = workspace / ".llm-plan-execute" / "pr-body.md"
+    ok_auth, auth_reason = gh_available_and_authenticated()
+    if not ok_auth:
+        write_text_report(out_path, body)
+        print(f"GitHub CLI unavailable or not authenticated ({auth_reason}). PR creation skipped.")
+        print(f"Wrote proposed PR body to {out_path}")
+        return
+    created, msg = try_github_pr_create(repo, pr_title, body)
+    if created:
+        print(msg)
+        return
+    write_text_report(out_path, body)
+    print(f"Could not create PR: {msg}")
+    print(f"Wrote proposed PR body to {out_path}")
+
+
+def maybe_offer_github_pr(
     *,
     workspace: Path,
     wf: WorkflowState,
@@ -492,12 +517,7 @@ def maybe_offer_github_pr(  # noqa: C901
     if create_pr_without_prompt:
         attempt_pr = True
     elif interactive_tty:
-        print("Build review is complete. Create a PR? [y/N]", flush=True)
-        try:
-            answer = input().strip().lower()
-        except EOFError:
-            answer = ""
-        attempt_pr = answer in {"y", "yes"}
+        attempt_pr = _interactive_user_accepts_pr_prompt()
     else:
         write_text_report(out_path, body)
         print("Non-interactive session: PR creation skipped (set build.create_pr to true to enable).")
@@ -509,21 +529,7 @@ def maybe_offer_github_pr(  # noqa: C901
         print(f"Skipped PR creation. Draft body written to {out_path}")
         return
 
-    ok_auth, auth_reason = gh_available_and_authenticated()
-    if not ok_auth:
-        write_text_report(out_path, body)
-        print(f"GitHub CLI unavailable or not authenticated ({auth_reason}). PR creation skipped.")
-        print(f"Wrote proposed PR body to {out_path}")
-        return
-
-    created, msg = try_github_pr_create(repo, pr_title, body)
-    if created:
-        print(msg)
-        return
-
-    write_text_report(out_path, body)
-    print(f"Could not create PR: {msg}")
-    print(f"Wrote proposed PR body to {out_path}")
+    _try_github_pr_or_write_fallback(workspace, repo, pr_title, body)
 
 
 def write_text_report(path: Path, content: str) -> None:
