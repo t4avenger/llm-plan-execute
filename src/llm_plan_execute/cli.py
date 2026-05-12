@@ -5,12 +5,13 @@ import json
 import shutil
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from rich.console import Console
 
-from .artifacts import load_state
+from .artifacts import load_state, write_state, write_text
 from .config import (
     DEFAULT_CONFIG,
     AppConfig,
@@ -42,11 +43,14 @@ from .types import (
 )
 from .workflow import accept_plan, run_planning
 from .workflow_runner import (
+    PLAN_PERMISSION_FALLBACK_WARNING,
     execute_build_through_completion,
     gate_stage_transition,
     interactive_plan_review,
+    is_run_planning_permission_failure,
     merge_execution_dirs,
     orchestrate_clarification,
+    plan_permission_workspace_write_fallback_applies,
 )
 from .workflow_state import (
     WorkflowState,
@@ -277,7 +281,7 @@ def _cmd_models(router: ProviderRouter) -> int:
     return 0
 
 
-def _plan_run_planning_phase(
+def _plan_run_planning_once(
     args: argparse.Namespace,
     prompt: str,
     router: ProviderRouter,
@@ -286,6 +290,8 @@ def _plan_run_planning_phase(
     progress: ProgressReporter,
     wf: WorkflowState,
     session: InteractiveSession,
+    *,
+    permission_mode: str | None,
 ) -> RunState | int:
     if args.no_clarify:
         run = run_planning(
@@ -294,7 +300,7 @@ def _plan_run_planning_phase(
             router,
             auto_accept=args.yes,
             execution=execution,
-            permission_mode=args.permission_mode,
+            permission_mode=permission_mode,
             progress=progress.update,
         )
         transition_stage(wf, "plan_review")
@@ -309,7 +315,7 @@ def _plan_run_planning_phase(
         router=router,
         runs_dir=app_config.runs_dir,
         execution=execution,
-        permission_mode=args.permission_mode,
+        permission_mode=permission_mode,
         progress=progress.update,
         session=session,
         no_clarify=False,
@@ -324,6 +330,63 @@ def _plan_run_planning_phase(
         wf.lifecycle_status = "completed"
         save_workflow_state(run.run_dir, wf)
     return run
+
+
+def _plan_run_planning_phase(
+    args: argparse.Namespace,
+    prompt: str,
+    router: ProviderRouter,
+    app_config: AppConfig,
+    execution,
+    progress: ProgressReporter,
+    wf: WorkflowState,
+    session: InteractiveSession,
+) -> RunState | int:
+    permission_mode = args.permission_mode
+    return _planning_with_permission_fallback(
+        args=args,
+        execution=execution,
+        permission_mode=permission_mode,
+        run_once=lambda retry_permission_mode: _plan_run_planning_once(
+            args,
+            prompt,
+            router,
+            app_config,
+            execution,
+            progress,
+            wf,
+            session,
+            permission_mode=retry_permission_mode,
+        ),
+    )
+
+
+def _planning_with_permission_fallback(
+    *,
+    args: argparse.Namespace,
+    execution,
+    permission_mode: str | None,
+    run_once: Callable[[str | None], RunState | int],
+) -> RunState | int:
+    outcome = run_once(permission_mode)
+    if isinstance(outcome, int):
+        return outcome
+    if plan_permission_workspace_write_fallback_applies(
+        execution, permission_mode_cli=permission_mode, no_clarify=args.no_clarify
+    ) and is_run_planning_permission_failure(outcome):
+        print(PLAN_PERMISSION_FALLBACK_WARNING, file=sys.stderr)
+        retried = run_once("workspace-write")
+        if isinstance(retried, RunState):
+            _record_plan_permission_fallback_warning(retried)
+        return retried
+    return outcome
+
+
+def _record_plan_permission_fallback_warning(run: RunState) -> None:
+    if PLAN_PERMISSION_FALLBACK_WARNING not in run.warnings:
+        run.warnings.append(PLAN_PERMISSION_FALLBACK_WARNING)
+    write_state(run)
+    write_text(run, "report.md", render_report(run))
 
 
 def _plan_print_run_and_proposed_hints(
@@ -395,7 +458,7 @@ def _cmd_plan(
     return _plan_finish_accept_or_review(args, session, run, wf, router, execution, progress)
 
 
-def _run_planning_only(
+def _run_planning_once(
     args: argparse.Namespace,
     prompt: str,
     router: ProviderRouter,
@@ -404,6 +467,8 @@ def _run_planning_only(
     progress: ProgressReporter,
     wf: WorkflowState,
     session: InteractiveSession,
+    *,
+    permission_mode: str | None,
 ) -> RunState | int:
     if args.no_clarify:
         run = run_planning(
@@ -412,7 +477,7 @@ def _run_planning_only(
             router,
             auto_accept=False,
             execution=execution,
-            permission_mode=args.permission_mode,
+            permission_mode=permission_mode,
             progress=progress.update,
         )
         transition_stage(wf, "plan_review")
@@ -423,7 +488,7 @@ def _run_planning_only(
         router=router,
         runs_dir=app_config.runs_dir,
         execution=execution,
-        permission_mode=args.permission_mode,
+        permission_mode=permission_mode,
         progress=progress.update,
         session=session,
         no_clarify=False,
@@ -432,6 +497,35 @@ def _run_planning_only(
     if isinstance(outcome, int):
         return outcome
     return outcome
+
+
+def _run_planning_only(
+    args: argparse.Namespace,
+    prompt: str,
+    router: ProviderRouter,
+    app_config: AppConfig,
+    execution,
+    progress: ProgressReporter,
+    wf: WorkflowState,
+    session: InteractiveSession,
+) -> RunState | int:
+    permission_mode = args.permission_mode
+    return _planning_with_permission_fallback(
+        args=args,
+        execution=execution,
+        permission_mode=permission_mode,
+        run_once=lambda retry_permission_mode: _run_planning_once(
+            args,
+            prompt,
+            router,
+            app_config,
+            execution,
+            progress,
+            wf,
+            session,
+            permission_mode=retry_permission_mode,
+        ),
+    )
 
 
 def _run_print_proposed_plan_banner(run: RunState) -> None:
