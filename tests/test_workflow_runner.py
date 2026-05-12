@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from llm_plan_execute.config import ExecutionConfig
+from llm_plan_execute.git_flow import GitFlowError
 from llm_plan_execute.interactive import (
     BuildReviewDecision,
     CompletionReportDecision,
@@ -15,9 +16,10 @@ from llm_plan_execute.interactive import (
     StepThroughOutcome,
     session_with_mock_stdin,
 )
-from llm_plan_execute.types import RunState
+from llm_plan_execute.types import ModelAssignment, ModelInfo, ProviderActivity, ProviderResult, RunState, Usage
 from llm_plan_execute.workflow import BuildFailedError
 from llm_plan_execute.workflow_runner import (
+    _checkpoint_after_build,
     _checkpoint_build_milestones,
     _checkpoint_review_fixes,
     _finish_build_completion,
@@ -513,6 +515,265 @@ def test_checkpoint_build_milestones_records_test_context(monkeypatch, tmp_path:
 
     assert calls == [("implementation-complete", "post-build workspace changes", ["src/a.py", "tests/test_a.py"])]
     assert added[0]["metadata"]["label"] == "tests-added-or-updated"
+
+
+def test_checkpoint_after_build_no_changed_paths_skips_commit(monkeypatch, tmp_path: Path) -> None:
+    commit_calls: list[bool] = []
+
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.find_git_root", lambda _workspace: tmp_path)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.git_changed_pathspecs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        "llm_plan_execute.workflow_runner._checkpoint_build_milestones",
+        lambda *_args, **_kwargs: commit_calls.append(True),
+    )
+
+    run = RunState.create("prompt", tmp_path)
+    result = _checkpoint_after_build(
+        tmp_path,
+        run,
+        WorkflowState(),
+        MagicMock(),
+        ExecutionConfig(),
+        "workspace-write",
+        _noop_progress,
+        runs_root=tmp_path / "runs",
+    )
+
+    assert result is None
+    assert commit_calls == []
+
+
+def test_checkpoint_after_build_success_returns_none(monkeypatch, tmp_path: Path) -> None:
+    commit_calls: list[list[str]] = []
+
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.find_git_root", lambda _workspace: tmp_path)
+    monkeypatch.setattr(
+        "llm_plan_execute.workflow_runner.git_changed_pathspecs",
+        lambda *_args, **_kwargs: ["src/a.py"],
+    )
+    monkeypatch.setattr(
+        "llm_plan_execute.workflow_runner._checkpoint_build_milestones",
+        lambda _workspace, _root, _run, paths, **_kwargs: commit_calls.append(paths),
+    )
+
+    run = RunState.create("prompt", tmp_path)
+    result = _checkpoint_after_build(
+        tmp_path,
+        run,
+        WorkflowState(),
+        MagicMock(),
+        ExecutionConfig(),
+        "workspace-write",
+        _noop_progress,
+        runs_root=tmp_path / "runs",
+    )
+
+    assert result is None
+    assert commit_calls == [["src/a.py"]]
+
+
+def test_execute_build_remediates_checkpoint_failure_and_continues(monkeypatch, tmp_path: Path) -> None:
+    model = ModelInfo("local", "builder")
+    commit_calls: list[tuple[str, list[str]]] = []
+    builder_prompts: list[str] = []
+    pr_calls: list[dict[str, object]] = []
+    review_calls: list[bool] = []
+
+    class FakeContext:
+        def __init__(self, _workspace: Path) -> None:
+            pass
+
+        def init(self) -> None:
+            return None
+
+        def add_context_item(self, **_kwargs: object) -> None:
+            return None
+
+    def fake_run_build(run: RunState, _router, **_kwargs) -> RunState:
+        run.accepted_plan = "accepted plan"
+        run.build_output = "initial build output"
+        run.assignments["builder"] = ModelAssignment("builder", model)
+        return run
+
+    def fake_commit(_root: Path, label: str, _summary: str, paths: list[str], **_kwargs: object) -> None:
+        commit_calls.append((label, paths))
+        if len(commit_calls) == 1:
+            raise GitFlowError("ruff failed\nfix me")
+
+    def fake_review(**_kwargs) -> None:
+        review_calls.append(True)
+
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.run_build", fake_run_build)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.find_git_root", lambda _workspace: tmp_path)
+    monkeypatch.setattr(
+        "llm_plan_execute.workflow_runner.git_changed_pathspecs",
+        lambda *_args, **_kwargs: ["src/a.py"],
+    )
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.ContextStore", FakeContext)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.commit_checkpoint", fake_commit)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.interactive_build_review_loop", fake_review)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.finalize_completion_reports", _stub_none)
+    monkeypatch.setattr(
+        "llm_plan_execute.workflow_runner.maybe_offer_github_pr",
+        lambda **kwargs: pr_calls.append(kwargs),
+    )
+
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    run = RunState.create("prompt", runs_root)
+    run.run_dir.mkdir(parents=True)
+    wf = WorkflowState(stage="pre_build")
+    router = MagicMock()
+    router.workspace = tmp_path
+    router.run.side_effect = lambda _role, _model, prompt, *_args: (
+        builder_prompts.append(prompt) or ProviderResult("builder", model, prompt, "remediated", Usage(), 0.0)
+    )
+
+    _, code = execute_build_through_completion(
+        run=run,
+        wf=wf,
+        router=router,
+        execution=ExecutionConfig(),
+        session=InteractiveSession(non_interactive=True),
+        permission_mode_cli=None,
+        progress=_noop_progress,
+        runs_root=runs_root,
+        build_create_pr=True,
+    )
+
+    assert code == 0
+    assert [call[0] for call in commit_calls] == ["implementation-complete", "implementation-complete"]
+    assert "ruff failed\nfix me" in (run.run_dir / "12-commit-remediation.md").read_text(encoding="utf-8")
+    assert "Exact failed commit/pre-commit output" in builder_prompts[0]
+    assert review_calls == [True]
+    assert pr_calls
+
+
+def test_execute_build_remediation_wraps_provider_activity(monkeypatch, tmp_path: Path) -> None:  # noqa: C901
+    model = ModelInfo("local", "builder")
+    progress_events: list[tuple[str, str]] = []
+
+    class FakeContext:
+        def __init__(self, _workspace: Path) -> None:
+            pass
+
+        def init(self) -> None:
+            return None
+
+    def fake_run_build(run: RunState, _router, **_kwargs) -> RunState:
+        run.accepted_plan = "accepted plan"
+        run.build_output = "initial build output"
+        run.assignments["builder"] = ModelAssignment("builder", model)
+        return run
+
+    def fake_commit(_root: Path, _label: str, _summary: str, _paths: list[str], **_kwargs: object) -> None:
+        if not hasattr(fake_commit, "failed"):
+            fake_commit.failed = True
+            raise GitFlowError("ruff failed")
+
+    changed_path_calls = 0
+
+    def fake_changed_paths(*_args, **_kwargs) -> list[str]:
+        nonlocal changed_path_calls
+        changed_path_calls += 1
+        return ["src/a.py"] if changed_path_calls == 1 else []
+
+    def progress(event: str, role: str, *_args) -> None:
+        progress_events.append((event, role))
+
+    def fake_builder_run(_role, _model, prompt, policy, activity):
+        assert policy.mode == "full-access"
+        assert callable(activity)
+        activity(ProviderActivity("builder", model, "message", "fixed formatting"))
+        return ProviderResult("builder", model, prompt, "remediated", Usage(), 0.0)
+
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.run_build", fake_run_build)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.find_git_root", lambda _workspace: tmp_path)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.git_changed_pathspecs", fake_changed_paths)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.ContextStore", FakeContext)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.commit_checkpoint", fake_commit)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.interactive_build_review_loop", _stub_none)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.finalize_completion_reports", _stub_none)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.maybe_offer_github_pr", lambda **_: None)
+
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    run = RunState.create("prompt", runs_root)
+    run.run_dir.mkdir(parents=True)
+    router = MagicMock()
+    router.workspace = tmp_path
+    router.run.side_effect = fake_builder_run
+
+    _, code = execute_build_through_completion(
+        run=run,
+        wf=WorkflowState(stage="pre_build"),
+        router=router,
+        execution=ExecutionConfig(),
+        session=InteractiveSession(non_interactive=True),
+        permission_mode_cli="full-access",
+        progress=progress,
+        runs_root=runs_root,
+    )
+
+    assert code == 0
+    assert run._last_provider_activity.message == "fixed formatting"  # type: ignore[attr-defined]
+    assert ("activity", "builder") in progress_events
+
+
+def test_execute_build_checkpoint_remediation_retry_failure_is_controlled(monkeypatch, tmp_path: Path) -> None:
+    model = ModelInfo("local", "builder")
+
+    class FakeContext:
+        def __init__(self, _workspace: Path) -> None:
+            pass
+
+        def init(self) -> None:
+            return None
+
+    def fake_run_build(run: RunState, _router, **_kwargs) -> RunState:
+        run.accepted_plan = "accepted plan"
+        run.build_output = "initial build output"
+        run.assignments["builder"] = ModelAssignment("builder", model)
+        return run
+
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.run_build", fake_run_build)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.find_git_root", lambda _workspace: tmp_path)
+    monkeypatch.setattr(
+        "llm_plan_execute.workflow_runner.git_changed_pathspecs",
+        lambda *_args, **_kwargs: ["src/a.py"],
+    )
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.ContextStore", FakeContext)
+    monkeypatch.setattr(
+        "llm_plan_execute.workflow_runner.commit_checkpoint",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(GitFlowError("pre-commit still failed")),
+    )
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.interactive_build_review_loop", _stub_none)
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.maybe_offer_github_pr", lambda **_: None)
+
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    run = RunState.create("prompt", runs_root)
+    run.run_dir.mkdir(parents=True)
+    wf = WorkflowState(stage="pre_build")
+    router = MagicMock()
+    router.workspace = tmp_path
+    router.run.return_value = ProviderResult("builder", model, "prompt", "attempted fix", Usage(), 0.0)
+
+    _, code = execute_build_through_completion(
+        run=run,
+        wf=wf,
+        router=router,
+        execution=ExecutionConfig(),
+        session=InteractiveSession(non_interactive=True),
+        permission_mode_cli=None,
+        progress=_noop_progress,
+        runs_root=runs_root,
+    )
+
+    assert code == 1
+    assert wf.lifecycle_status == "failed"
+    assert (run.run_dir / "12-commit-remediation.md").exists()
+    assert (run.run_dir / "13-commit-remediation-output.md").read_text(encoding="utf-8") == "attempted fix\n"
 
 
 def test_checkpoint_review_fixes_commits_changed_paths(monkeypatch, tmp_path: Path) -> None:
