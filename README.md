@@ -22,9 +22,20 @@ Install the CLI into an isolated environment for day-to-day use (recommended):
 ```bash
 pipx install .
 llm-plan-execute --help
+llm-plan-execute            # interactive wizard (TTY only)
 llm-plan-execute plan
 llm-plan-execute --repo /path/to/other/repo plan
 ```
+
+Running `llm-plan-execute` with no subcommand on an interactive terminal launches a wizard that:
+
+- Confirms the workspace (`--repo` or current directory).
+- Detects `.llm-plan-execute/config.json` and offers to use, validate, or reconfigure it. Use `--reconfigure` to force the reconfigure prompts.
+- Detects paused runs and offers to resume them with `build`.
+- Prompts for the task text (inline or via `$EDITOR`).
+- Hands off to the existing `run` / `build` paths so progress, artifacts, and permission handling are unchanged.
+
+When stdin is not a TTY (CI/automation) or `--non-interactive` / `--ci` is set, the bare command prints help and exits non-zero — use a subcommand instead.
 
 Run the workflow with simulated providers from a development checkout:
 

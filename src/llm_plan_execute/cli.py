@@ -89,7 +89,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use deterministic defaults for menus (also implied when stdin is not a TTY).",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "--reconfigure",
+        action="store_true",
+        help="In wizard mode, rerun provider/model setup even when a config exists.",
+    )
+    sub = parser.add_subparsers(dest="command", required=False)
 
     init = sub.add_parser("init-config", help="Write a sample local config.")
     init.add_argument("--path", type=Path, default=DEFAULT_CONFIG)
@@ -166,8 +171,12 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     workspace = resolve_repo(args.repo)
+
+    if args.command is None:
+        return _handle_no_command(args, workspace, parser)
 
     if args.command == "init-config":
         return _cmd_init_config(args, workspace)
@@ -183,6 +192,21 @@ def _run(argv: list[str] | None = None) -> int:
     progress = ProgressReporter(enabled=not args.quiet, verbose=args.verbose, stream=sys.stderr, ui=args.ui)
 
     return _dispatch_command(args, router, app_config, progress)
+
+
+def _handle_no_command(
+    args: argparse.Namespace,
+    workspace: Path,
+    parser: argparse.ArgumentParser,
+) -> int:
+    """Launch the interactive wizard on a TTY, otherwise print help and exit nonzero."""
+    from .wizard import is_tty, run_wizard
+
+    if args.non_interactive or not is_tty(sys.stdin):
+        parser.print_help(sys.stderr)
+        print("\nNo subcommand provided; pass --help or a subcommand.", file=sys.stderr)
+        return 1
+    return run_wizard(args, workspace)
 
 
 def _dispatch_command(
