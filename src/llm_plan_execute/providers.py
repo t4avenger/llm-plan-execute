@@ -4,6 +4,7 @@ import json
 import selectors
 import shutil
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -84,6 +85,7 @@ class DryRunProvider(Provider):
 class ProviderCommand:
     args: list[str]
     cwd: Path
+    stdin: str | None = None
 
 
 class ProviderAdapter:
@@ -126,9 +128,10 @@ class CodexAdapter(ProviderAdapter):
                 *permission_args,
                 "--cd",
                 str(resolved_workspace),
-                prompt,
+                "-",
             ],
             resolved_workspace,
+            prompt,
         )
 
 
@@ -171,7 +174,11 @@ class ClaudeAdapter(ProviderAdapter):
         _execution_policy: ExecutionPolicy,
     ) -> ProviderCommand:
         resolved_workspace = workspace.resolve()
-        return ProviderCommand([config.command, "--model", model.name, prompt], resolved_workspace)
+        return ProviderCommand(
+            [config.command, "--model", model.name, "--print", "--input-format", "text"],
+            resolved_workspace,
+            prompt,
+        )
 
 
 ADAPTERS: dict[str, ProviderAdapter] = {
@@ -260,7 +267,11 @@ class CLIProvider(Provider):
         if not _should_retry_cursor_without_sandbox(self.config.name, provider_command.args, completed):
             return completed, None
 
-        retry_command = ProviderCommand(_without_cursor_sandbox_args(provider_command.args), provider_command.cwd)
+        retry_command = ProviderCommand(
+            _without_cursor_sandbox_args(provider_command.args),
+            provider_command.cwd,
+            provider_command.stdin,
+        )
         retry = _run_provider_command(
             retry_command,
             provider_name=self.config.name,
@@ -353,6 +364,7 @@ def _run_provider_command(
         provider_command.args,
         cwd=provider_command.cwd,
         text=True,
+        input=provider_command.stdin,
         capture_output=True,
         check=False,
         timeout=PROVIDER_RUN_TIMEOUT_SEC,
@@ -373,9 +385,11 @@ def _run_provider_command_streaming(
         args,
         cwd=provider_command.cwd,
         text=True,
+        stdin=subprocess.PIPE if provider_command.stdin is not None else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+    stdin_thread = _feed_provider_stdin(proc, provider_command.stdin)
     stdout, stderr = _collect_streaming_output(
         proc,
         args=args,
@@ -386,12 +400,32 @@ def _run_provider_command_streaming(
         start=start,
         workspace=provider_command.cwd,
     )
+    if stdin_thread is not None:
+        stdin_thread.join(timeout=1)
     return subprocess.CompletedProcess(
         args,
         proc.returncode if proc.returncode is not None else 0,
         stdout=stdout,
         stderr=stderr,
     )
+
+
+def _feed_provider_stdin(proc: subprocess.Popen[str], stdin: str | None) -> threading.Thread | None:
+    if stdin is None:
+        return None
+    if proc.stdin is None:
+        raise subprocess.SubprocessError("provider stdin pipe was not available")
+
+    def feed() -> None:
+        try:
+            proc.stdin.write(stdin)
+            proc.stdin.close()
+        except OSError:
+            return
+
+    thread = threading.Thread(target=feed, daemon=True)
+    thread.start()
+    return thread
 
 
 def _collect_streaming_output(
@@ -501,6 +535,8 @@ def _claude_streaming_args(args: list[str]) -> list[str]:
         updated.insert(1, "--print")
     if "--output-format" not in updated:
         updated[1:1] = ["--output-format", "stream-json"]
+    if "stream-json" in updated and "--verbose" not in updated:
+        updated.insert(1, "--verbose")
     for flag in ("--include-partial-messages", "--include-hook-events"):
         if flag not in updated:
             updated.insert(1, flag)

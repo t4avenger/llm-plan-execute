@@ -1,6 +1,8 @@
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from llm_plan_execute.config import ProviderConfig
 from llm_plan_execute.providers import (
     CURSOR_SANDBOX_RETRY_WARNING,
@@ -10,8 +12,11 @@ from llm_plan_execute.providers import (
     CodexAdapter,
     CursorAdapter,
     Provider,
+    ProviderCommand,
     ProviderRouter,
     _activity_from_stream_line,
+    _feed_provider_stdin,
+    _run_provider_command_streaming,
     _streaming_args,
 )
 from llm_plan_execute.types import ExecutionPolicy, ModelInfo, ProviderResult, Usage
@@ -65,9 +70,10 @@ def test_codex_adapter_builds_noninteractive_command():
         "workspace-write",
         "--cd",
         str(workspace.resolve()),
-        "write tests",
+        "-",
     ]
     assert command.cwd == workspace.resolve()
+    assert command.stdin == "write tests"
 
 
 def test_codex_adapter_builds_full_access_command():
@@ -182,8 +188,9 @@ def test_claude_adapter_builds_documented_extension_command():
 
     command = ClaudeAdapter().build_command(config, model, "review plan", workspace, ExecutionPolicy())
 
-    assert command.args == ["claude", "--model", "sonnet", "review plan"]
+    assert command.args == ["claude", "--model", "sonnet", "--print", "--input-format", "text"]
     assert command.cwd == workspace.resolve()
+    assert command.stdin == "review plan"
 
 
 def test_claude_provider_invokes_subprocess_with_documented_contract(monkeypatch, tmp_path):
@@ -206,13 +213,142 @@ def test_claude_provider_invokes_subprocess_with_documented_contract(monkeypatch
     result = provider.run("plan_reviewer_b", model, "review this plan", ExecutionPolicy())
 
     assert result.error is None
-    assert captured["cmd"] == ["claude", "--model", "opus", "review this plan"]
+    assert captured["cmd"] == ["claude", "--model", "opus", "--print", "--input-format", "text"]
     kwargs = captured["kwargs"]
     assert kwargs["cwd"] == tmp_path.resolve()
     assert kwargs["timeout"] == PROVIDER_RUN_TIMEOUT_SEC
     assert kwargs["text"] is True
+    assert kwargs["input"] == "review this plan"
     assert kwargs["capture_output"] is True
     assert kwargs["check"] is False
+
+
+def test_codex_provider_sends_prompt_via_stdin(monkeypatch, tmp_path):
+    model = ModelInfo("codex", "gpt-5.4")
+    provider = CLIProvider(
+        ProviderConfig("codex", "codex", True, (model,)),
+        workspace=tmp_path,
+    )
+    prompt = "large prompt " * 1000
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("llm_plan_execute.providers.shutil.which", lambda command: f"/fake/{command}")
+    monkeypatch.setattr("llm_plan_execute.providers.subprocess.run", fake_run)
+
+    result = provider.run("builder", model, prompt, ExecutionPolicy())
+
+    assert result.error is None
+    assert captured["cmd"][-1] == "-"
+    assert prompt not in captured["cmd"]
+    assert captured["kwargs"]["input"] == prompt
+
+
+def test_feed_provider_stdin_writes_and_closes_pipe():
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.value = ""
+            self.closed_called = False
+
+        def write(self, text: str) -> None:
+            self.value += text
+
+        def close(self) -> None:
+            self.closed_called = True
+
+    class FakeProcess:
+        stdin = FakeStdin()
+
+    proc = FakeProcess()
+    thread = _feed_provider_stdin(proc, "streamed prompt")
+
+    assert thread is not None
+    thread.join(timeout=1)
+    assert proc.stdin.value == "streamed prompt"
+    assert proc.stdin.closed_called is True
+
+
+def test_feed_provider_stdin_requires_pipe():
+    class FakeProcess:
+        stdin = None
+
+    with pytest.raises(subprocess.SubprocessError, match="stdin pipe"):
+        _feed_provider_stdin(FakeProcess(), "prompt")
+
+
+def test_feed_provider_stdin_no_prompt_returns_none():
+    class FakeProcess:
+        stdin = None
+
+    assert _feed_provider_stdin(FakeProcess(), None) is None
+
+
+def test_feed_provider_stdin_ignores_broken_pipe():
+    class BrokenStdin:
+        def write(self, _text: str) -> None:
+            raise BrokenPipeError
+
+        def close(self) -> None:
+            raise AssertionError("close should not run after a broken write")
+
+    class FakeProcess:
+        stdin = BrokenStdin()
+
+    thread = _feed_provider_stdin(FakeProcess(), "prompt")
+
+    assert thread is not None
+    thread.join(timeout=1)
+
+
+def test_streaming_provider_command_uses_stdin_pipe(monkeypatch, tmp_path):
+    model = ModelInfo("codex", "gpt")
+    captured: dict[str, object] = {}
+
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.value = ""
+            self.closed = False
+
+        def write(self, text: str) -> None:
+            self.value += text
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeProcess:
+        def __init__(self, args, **kwargs) -> None:
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            self.stdin = FakeStdin()
+            self.returncode = 0
+
+    def fake_collect(proc, **_kwargs):
+        captured["stdin"] = proc.stdin
+        return "out", "err"
+
+    monkeypatch.setattr("llm_plan_execute.providers.subprocess.Popen", FakeProcess)
+    monkeypatch.setattr("llm_plan_execute.providers._collect_streaming_output", fake_collect)
+
+    completed = _run_provider_command_streaming(
+        ProviderCommand(["codex", "exec", "--model", "gpt", "-"], tmp_path, "streamed prompt"),
+        provider_name="codex",
+        role="builder",
+        model=model,
+        activity=lambda _item: None,
+        start=0,
+    )
+
+    assert completed.stdout == "out"
+    assert completed.stderr == "err"
+    assert captured["args"] == ["codex", "exec", "--model", "gpt", "--json", "-"]
+    assert captured["kwargs"]["stdin"] is subprocess.PIPE
+    stdin = captured["stdin"]
+    assert stdin.value == "streamed prompt"
+    assert stdin.closed is True
 
 
 def test_claude_provider_maps_subprocess_timeout(monkeypatch):
@@ -268,6 +404,7 @@ def test_streaming_args_enable_provider_json_modes():
     assert "--stream-partial-output" in cursor
     claude = _streaming_args("claude", ["claude", "--model", "sonnet", "prompt"])
     assert "--print" in claude
+    assert "--verbose" in claude
     assert "stream-json" in claude
 
 

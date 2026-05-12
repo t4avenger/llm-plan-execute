@@ -597,7 +597,16 @@ def _run_build_stage(
     except BuildFailedError as exc:
         return _handle_build_failure(exc, wf)
     _mark_build_review_stage(run, wf)
-    checkpoint = _checkpoint_after_build(router.workspace, run, progress, runs_root=runs_root)
+    checkpoint = _checkpoint_after_build(
+        router.workspace,
+        run,
+        wf,
+        router,
+        execution,
+        build_permission,
+        progress,
+        runs_root=runs_root,
+    )
     return checkpoint or run
 
 
@@ -621,6 +630,10 @@ def _mark_build_review_stage(run: RunState, wf: WorkflowState) -> None:
 def _checkpoint_after_build(
     workspace: Path,
     run: RunState,
+    wf: WorkflowState,
+    router: ProviderRouter,
+    execution: ExecutionConfig,
+    build_permission: str,
     progress: ProgressHook,
     *,
     runs_root: Path,
@@ -635,9 +648,114 @@ def _checkpoint_after_build(
         _emit_local_progress(progress, run, "checkpointing implementation changes")
         _checkpoint_build_milestones(workspace, git_root, run, paths, runs_root=runs_root)
     except GitFlowError as exc:
-        print(f"Checkpoint commit failed: {exc}")
+        return _remediate_failed_build_checkpoint(
+            workspace=workspace,
+            git_root=git_root,
+            run=run,
+            wf=wf,
+            router=router,
+            execution=execution,
+            build_permission=build_permission,
+            progress=progress,
+            runs_root=runs_root,
+            changed_paths=paths,
+            failure_output=str(exc),
+        )
+    return None
+
+
+def _remediate_failed_build_checkpoint(
+    *,
+    workspace: Path,
+    git_root: Path,
+    run: RunState,
+    wf: WorkflowState,
+    router: ProviderRouter,
+    execution: ExecutionConfig,
+    build_permission: str,
+    progress: ProgressHook,
+    runs_root: Path,
+    changed_paths: list[str],
+    failure_output: str,
+) -> tuple[RunState, int] | None:
+    remediation_path = write_text(
+        run,
+        "12-commit-remediation.md",
+        _commit_remediation_context(run, changed_paths, failure_output),
+    )
+    _emit_local_progress(progress, run, "asking builder to fix checkpoint commit failure")
+    policy = execution.policy_for_role("builder", mode_override=build_permission)
+    result = router.run(
+        "builder",
+        run.assignments["builder"].model,
+        _commit_remediation_prompt(run, changed_paths, failure_output),
+        policy,
+        _build_checkpoint_activity_callback(progress, run),
+    )
+    run.results.append(result)
+    run.build_output = result.output
+    write_text(run, "13-commit-remediation-output.md", result.output)
+    write_state(run)
+    write_text(run, _REPORT_MARKDOWN_FILENAME, render_report(run))
+
+    retry_paths = git_changed_pathspecs(git_root, excluded_roots=[runs_root])
+    if not retry_paths:
+        retry_paths = changed_paths
+    try:
+        _emit_local_progress(progress, run, "retrying checkpoint commit after remediation")
+        _checkpoint_build_milestones(workspace, git_root, run, retry_paths, runs_root=runs_root)
+    except GitFlowError as retry_exc:
+        wf.lifecycle_status = "failed"
+        save_workflow_state(run.run_dir, wf)
+        print(f"Checkpoint commit retry failed: {retry_exc}")
+        print(f"Commit remediation context: {remediation_path}")
+        print(f"Report: {run.run_dir / _REPORT_MARKDOWN_FILENAME}")
         return run, 1
     return None
+
+
+def _build_checkpoint_activity_callback(progress: ProgressHook, run: RunState):
+    def activity(item) -> None:
+        run._last_provider_activity = item  # type: ignore[attr-defined]
+        progress("activity", item.role, run, item.model, None, None)
+
+    return activity
+
+
+def _commit_remediation_context(run: RunState, changed_paths: list[str], failure_output: str) -> str:
+    return "\n\n".join(
+        [
+            "# Commit Remediation",
+            "## Changed paths",
+            "\n".join(f"- {path}" for path in changed_paths) or "- none",
+            "## Failed commit/pre-commit output",
+            "```text\n" + failure_output.strip() + "\n```",
+            "## Accepted plan",
+            run.accepted_plan or "",
+            "## Build output",
+            run.build_output or "",
+        ]
+    )
+
+
+def _commit_remediation_prompt(run: RunState, changed_paths: list[str], failure_output: str) -> str:
+    return "\n\n".join(
+        [
+            "The implementation build completed, but the checkpoint commit failed, usually because a git hook "
+            "or pre-commit check rejected the workspace.",
+            "Fix the workspace so the same checkpoint commit can succeed. Do not bypass hooks.",
+            "Changed paths:",
+            "\n".join(f"- {path}" for path in changed_paths) or "- none",
+            "Exact failed commit/pre-commit output:",
+            "```text\n" + failure_output.strip() + "\n```",
+            "Accepted plan:",
+            run.accepted_plan or "",
+            "Build output:",
+            run.build_output or "",
+            "Make only the needed code, formatting, or test updates, then summarize what changed and what "
+            "verification you ran.",
+        ]
+    )
 
 
 def _run_build_review_stage(
