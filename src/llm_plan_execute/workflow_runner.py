@@ -545,11 +545,11 @@ def run_accepted_plan(
         base_branch_override=base_branch_override,
     )
     save_workflow_state(run.run_dir, wf)
-    if wf.stage not in {"pre_build", "build", "build_review"}:
+    if wf.stage != "pre_build" and can_transition(wf.stage, "pre_build"):
         transition_stage(wf, "pre_build")
         save_workflow_state(run.run_dir, wf)
 
-    if pre_build_gate and not session.non_interactive:
+    if pre_build_gate and not session.non_interactive and wf.stage == "pre_build":
         transition = gate_stage_transition(session=session, wf=wf, run=run)
         if transition == "pause":
             state_path = save_workflow_state(run.run_dir, wf)
