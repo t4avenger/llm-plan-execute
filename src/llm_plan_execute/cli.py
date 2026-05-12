@@ -157,17 +157,8 @@ PAUSED_EXIT_CODE = WORKFLOW_PAUSED_EXIT_CODE
 
 
 def main(argv: list[str] | None = None) -> int:
-    try:
-        return _run(argv)
-    except InteractiveCanceledError:
-        print("Workflow canceled.", file=sys.stderr)
-        return 130
-    except GitFlowError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-    except (KeyError, OSError, TypeError, ValueError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+    """CLI entry used by ``python -m`` and console scripts."""
+    return _invoke_run_with_cli_exit_mapping(argv)
 
 
 def _run(argv: list[str] | None = None) -> int:
@@ -192,6 +183,29 @@ def _run(argv: list[str] | None = None) -> int:
     progress = ProgressReporter(enabled=not args.quiet, verbose=args.verbose, stream=sys.stderr, ui=args.ui)
 
     return _dispatch_command(args, router, app_config, progress)
+
+
+def _invoke_run_with_cli_exit_mapping(argv: list[str] | None = None) -> int:
+    try:
+        return _run(argv)
+    except InteractiveCanceledError:
+        print("Workflow canceled.", file=sys.stderr)
+        return 130
+    except GitFlowError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+def dispatch_argv(argv: list[str] | None = None) -> int:
+    """Run the CLI with ``argv``-style arguments (wizard hand-off, programmatic use, tests).
+
+    Tests may replace this name on ``llm_plan_execute.cli`` to intercept wizard sub-invocations
+    without affecting :func:`main`, which shares behavior via :func:`_invoke_run_with_cli_exit_mapping`.
+    """
+    return _invoke_run_with_cli_exit_mapping(argv)
 
 
 def _handle_no_command(

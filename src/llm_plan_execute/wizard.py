@@ -21,10 +21,13 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Sequence
+from dataclasses import dataclass
+from importlib import import_module
 from pathlib import Path
 
 from .config import (
     DEFAULT_ROOT,
+    SCORE_FIELDS,
     ConfigValidation,
     format_validation,
     resolve_config_path,
@@ -33,7 +36,14 @@ from .config import (
     validate_config_file,
 )
 from .interactive import ChoiceOption, InteractiveCanceledError, InteractiveSession
-from .workflow_state import WorkflowState, load_workflow_state
+from .types import ROLES
+from .workflow_state import (
+    WorkflowState,
+    WorkflowStateCorruptError,
+    WorkflowStateError,
+    WorkflowStateVersionError,
+    load_workflow_state,
+)
 
 # Roles documented in the wizard menus; mirrors ``types.ROLES``.
 WIZARD_ROLE_HELP = (
@@ -41,6 +51,17 @@ WIZARD_ROLE_HELP = (
     "  planner, plan_reviewer_a, plan_reviewer_b, plan_arbiter,\n"
     "  builder, build_reviewer_a, build_reviewer_b, build_arbiter"
 )
+DEFAULT_SCORE = 3
+MIN_SCORE = 1
+MAX_SCORE = 5
+
+
+@dataclass(frozen=True)
+class PausedRunScan:
+    """Result of scanning ``runs_dir`` for workflow directories that can be resumed."""
+
+    paused: tuple[Path, ...]
+    warnings: tuple[str, ...]
 
 
 def is_tty(stream: object) -> bool:
@@ -74,7 +95,10 @@ def _run_wizard(args: argparse.Namespace, workspace: Path, session: InteractiveS
     if isinstance(config_outcome, int):
         return config_outcome
 
-    paused = _find_paused_runs(workspace, args.config)
+    scan = _find_paused_runs(workspace, args.config)
+    for warning in scan.warnings:
+        print(warning, file=sys.stderr)
+    paused = list(scan.paused)
     if paused:
         choice = _ask_paused_action(session, paused)
         if choice == "resume":
@@ -123,7 +147,7 @@ def _configure_new(
     if choice == "dry":
         args.dry_run = True
         return None
-    return _write_default_config(config_path)
+    return _write_default_config(config_path, session)
 
 
 def _configure_existing(
@@ -158,11 +182,22 @@ def _configure_overwrite(
     ):
         print("Keeping existing config.")
         return None
-    return _write_default_config(config_path)
+    return _write_default_config(config_path, session)
 
 
-def _write_default_config(config_path: Path) -> int | None:
+def _write_default_config(config_path: Path, session: InteractiveSession) -> int | None:
     sample = sample_config()
+    options = (
+        ChoiceOption("1", "Use auto-detected defaults (PATH-based enabled flags)", "defaults"),
+        ChoiceOption("2", "Customize providers, models, roles, and scores", "customize"),
+        ChoiceOption("3", "Cancel without saving", "cancel"),
+    )
+    setup = session.prompt_choice("How should provider setup be saved?", options)
+    if setup == "cancel":
+        raise InteractiveCanceledError("Wizard canceled before saving config.")
+    if setup == "customize":
+        print(WIZARD_ROLE_HELP, file=sys.stdout)
+        _interactive_edit_providers(session, sample)
     validation = validate_config_data(sample, require_providers=False)
     if validation.errors:
         print(format_validation(validation), file=sys.stderr)
@@ -179,6 +214,132 @@ def _write_default_config(config_path: Path) -> int | None:
             "or run with --dry-run for simulated providers."
         )
     return None
+
+
+def _interactive_edit_providers(session: InteractiveSession, raw: dict[str, object]) -> None:
+    providers = raw.get("providers")
+    if not isinstance(providers, list):
+        return
+    for index, provider in enumerate(providers):
+        if not isinstance(provider, dict):
+            continue
+        _interactive_edit_provider(session, provider, index)
+
+
+def _interactive_edit_provider(session: InteractiveSession, provider: dict[str, object], index: int) -> None:
+    label = _provider_label(provider, index)
+    print(f"\n--- Provider: {label} ---")
+    enabled = session.prompt_confirm(f"Enable provider {label!r}?", default_yes=bool(provider.get("enabled", True)))
+    provider["enabled"] = enabled
+    if not enabled:
+        print(f"  (Skipping models for disabled provider {label!r}.)")
+        return
+    _interactive_edit_provider_command(session, provider, label)
+    _interactive_edit_provider_models(session, provider, label)
+
+
+def _provider_label(provider: dict[str, object], index: int) -> str:
+    name = provider.get("name")
+    return name if isinstance(name, str) else f"provider[{index}]"
+
+
+def _interactive_edit_provider_command(session: InteractiveSession, provider: dict[str, object], label: str) -> None:
+    default_cmd = str(provider.get("command", label) or label)
+    cmd_line = session.prompt_free_text(f"Command to invoke [{default_cmd}]:", required=False)
+    if cmd_line.strip():
+        provider["command"] = cmd_line.strip()
+
+
+def _interactive_edit_provider_models(session: InteractiveSession, provider: dict[str, object], label: str) -> None:
+    models = provider.get("models")
+    if not isinstance(models, list):
+        return
+    for mindex, model in enumerate(models):
+        if not isinstance(model, dict):
+            continue
+        print(f"\n  --- Model {mindex + 1} in {label} ---")
+        _interactive_edit_model(session, model)
+
+
+def _interactive_edit_model(session: InteractiveSession, model: dict[str, object]) -> None:
+    _interactive_edit_model_name(session, model)
+    _interactive_edit_model_roles(session, model)
+    _interactive_edit_model_scores(session, model)
+
+
+def _interactive_edit_model_name(session: InteractiveSession, model: dict[str, object]) -> None:
+    current_name = str(model.get("name", "") or "")
+    name_line = session.prompt_free_text(f"  Model name [{current_name}]:", required=False)
+    if name_line.strip():
+        model["name"] = name_line.strip()
+
+
+def _interactive_edit_model_roles(session: InteractiveSession, model: dict[str, object]) -> None:
+    current_roles = model.get("roles", [])
+    if not isinstance(current_roles, list):
+        current_roles = []
+    roles_joined = ",".join(str(r) for r in current_roles if isinstance(r, str))
+    roles_hint = roles_joined or "(none)"
+    roles_line = session.prompt_free_text(
+        f"  Roles (comma-separated) [{roles_hint}]; valid: {', '.join(ROLES)}:",
+        required=False,
+    )
+    if roles_line.strip():
+        chosen, invalid = _parse_roles(roles_line)
+        if invalid:
+            print(f"  Ignoring unknown roles: {', '.join(invalid)}", file=sys.stderr)
+        model["roles"] = chosen
+
+
+def _parse_roles(roles_line: str) -> tuple[list[str], list[str]]:
+    chosen: list[str] = []
+    invalid: list[str] = []
+    for token in roles_line.split(","):
+        piece = token.strip()
+        if not piece:
+            continue
+        target = chosen if piece in ROLES else invalid
+        target.append(piece)
+    return chosen, invalid
+
+
+def _interactive_edit_model_scores(session: InteractiveSession, model: dict[str, object]) -> None:
+    score_hint = " ".join(str(_model_score(model, field)) for field in SCORE_FIELDS)
+    score_line = session.prompt_free_text(
+        f"  Scores reasoning speed cost context (1-5 each) [{score_hint}]:",
+        required=False,
+    )
+    if score_line.strip():
+        parts = score_line.split()
+        if len(parts) != len(SCORE_FIELDS):
+            print(
+                f"  Expected {len(SCORE_FIELDS)} integers; keeping previous scores.",
+                file=sys.stderr,
+            )
+        else:
+            parsed = _parse_scores(parts)
+            if parsed is None:
+                print("  Invalid scores; keeping previous.", file=sys.stderr)
+                return
+            for field, value in zip(SCORE_FIELDS, parsed, strict=True):
+                model[field] = value
+
+
+def _model_score(model: dict[str, object], field: str) -> int:
+    value = model.get(field, DEFAULT_SCORE)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return DEFAULT_SCORE
+
+
+def _parse_scores(parts: list[str]) -> list[int] | None:
+    try:
+        scores = [int(part) for part in parts]
+    except ValueError:
+        return None
+    if any(score < MIN_SCORE or score > MAX_SCORE for score in scores):
+        return None
+    return scores
 
 
 def _enabled_provider_summary(raw: dict[str, object]) -> str:
@@ -209,24 +370,44 @@ def _print_validation(args: argparse.Namespace, workspace: Path) -> int:
     return 0
 
 
-def _find_paused_runs(workspace: Path, config_arg: Path | None) -> list[Path]:
+def _find_paused_runs(workspace: Path, config_arg: Path | None) -> PausedRunScan:
     runs_dir = _resolve_runs_dir(workspace, config_arg)
     if not runs_dir.exists():
-        return []
+        return PausedRunScan((), ())
     paused: list[Path] = []
+    warnings: list[str] = []
     for candidate in sorted(runs_dir.iterdir(), reverse=True):
         if not candidate.is_dir():
             continue
         wf_path = candidate / "workflow-state.json"
         if not wf_path.exists():
             continue
-        try:
-            wf: WorkflowState = load_workflow_state(candidate)
-        except (OSError, ValueError):
+        wf, warning = _load_paused_candidate(candidate)
+        if warning:
+            warnings.append(warning)
             continue
         if wf.lifecycle_status == "paused":
             paused.append(candidate)
-    return paused
+    return PausedRunScan(tuple(paused), tuple(warnings))
+
+
+def _load_paused_candidate(candidate: Path) -> tuple[WorkflowState, None] | tuple[None, str]:
+    try:
+        return load_workflow_state(candidate), None
+    except WorkflowStateVersionError as exc:
+        return None, (
+            f"Warning: skipped paused-run candidate {candidate.name}: "
+            f"workflow state is from a newer schema ({exc}). "
+            "Upgrade llm-plan-execute or archive this run if you need it."
+        )
+    except WorkflowStateCorruptError as exc:
+        return None, f"Warning: skipped paused-run candidate {candidate.name}: corrupt workflow state ({exc})."
+    except OSError as exc:
+        return None, f"Warning: skipped paused-run candidate {candidate.name}: could not read workflow state ({exc})."
+    except WorkflowStateError as exc:
+        return None, f"Warning: skipped paused-run candidate {candidate.name}: {exc}"
+    except ValueError as exc:
+        return None, f"Warning: skipped paused-run candidate {candidate.name}: unreadable workflow state ({exc})."
 
 
 def _resolve_runs_dir(workspace: Path, config_arg: Path | None) -> Path:
@@ -320,19 +501,20 @@ def _editor_argv(editor: str, path: Path) -> list[str]:
 
 def _dispatch_run(args: argparse.Namespace, prompt: str) -> int:
     """Hand off to the existing ``run`` command with the wizard's choices."""
-    from .cli import main as _cli_main
-
     forwarded = _forwarded_global_flags(args)
     argv = [*forwarded, "run", "--prompt", prompt]
-    return _cli_main(argv)
+    return _dispatch_cli_argv(argv)
 
 
 def _dispatch_build(args: argparse.Namespace, run_dir: Path) -> int:
-    from .cli import main as _cli_main
-
     forwarded = _forwarded_global_flags(args)
     argv = [*forwarded, "build", "--run-dir", str(run_dir)]
-    return _cli_main(argv)
+    return _dispatch_cli_argv(argv)
+
+
+def _dispatch_cli_argv(argv: list[str]) -> int:
+    cli = import_module("llm_plan_execute.cli")
+    return cli.dispatch_argv(argv)
 
 
 def _forwarded_global_flags(args: argparse.Namespace) -> list[str]:
@@ -354,6 +536,7 @@ def _forwarded_global_flags(args: argparse.Namespace) -> list[str]:
 
 __all__ = [
     "WIZARD_ROLE_HELP",
+    "PausedRunScan",
     "is_tty",
     "run_wizard",
 ]
