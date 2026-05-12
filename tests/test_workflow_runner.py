@@ -29,6 +29,7 @@ from llm_plan_execute.workflow_runner import (
     merge_execution_dirs,
     orchestrate_clarification,
     resolve_build_permission,
+    run_accepted_plan,
 )
 from llm_plan_execute.workflow_state import WorkflowState
 
@@ -378,6 +379,84 @@ def test_execute_build_through_completion_resumes_at_build_review_skips_run_buil
     assert wf.stage == "complete"
 
 
+def test_run_accepted_plan_skips_pre_build_gate_after_build_started(monkeypatch, tmp_path: Path) -> None:
+    """Resuming at build/build_review must not re-prompt for the pre-build boundary."""
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.prepare_implementation_entry", lambda *_args, **_kwargs: None)
+    execute_calls: list[str] = []
+
+    def fake_execute(**kwargs):
+        execute_calls.append(kwargs["wf"].stage)
+        return kwargs["run"], 0
+
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.execute_build_through_completion", fake_execute)
+
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    run = RunState.create("prompt", runs_root)
+    run.run_dir.mkdir(parents=True)
+    wf = WorkflowState(stage="build")
+    router = MagicMock()
+    router.workspace = tmp_path
+
+    _, code = run_accepted_plan(
+        run=run,
+        wf=wf,
+        router=router,
+        workspace=tmp_path,
+        runs_root=runs_root,
+        execution=ExecutionConfig(),
+        session=_StageSession("pause"),
+        permission_mode_cli=None,
+        progress=_noop_progress,
+        build_create_pr=False,
+        base_branch_override=None,
+    )
+
+    assert code == 0
+    assert execute_calls == ["build"]
+    assert wf.stage == "build"
+    assert wf.lifecycle_status == "active"
+
+
+def test_run_accepted_plan_does_not_rewind_terminal_stage(monkeypatch, tmp_path: Path) -> None:
+    """Terminal workflow state cannot transition back to pre_build."""
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.prepare_implementation_entry", lambda *_args, **_kwargs: None)
+    execute_calls: list[str] = []
+
+    def fake_execute(**kwargs):
+        execute_calls.append(kwargs["wf"].stage)
+        return kwargs["run"], 0
+
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.execute_build_through_completion", fake_execute)
+
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    run = RunState.create("prompt", runs_root)
+    run.run_dir.mkdir(parents=True)
+    wf = WorkflowState(stage="complete", lifecycle_status="completed")
+    router = MagicMock()
+    router.workspace = tmp_path
+
+    _, code = run_accepted_plan(
+        run=run,
+        wf=wf,
+        router=router,
+        workspace=tmp_path,
+        runs_root=runs_root,
+        execution=ExecutionConfig(),
+        session=_StageSession("pause"),
+        permission_mode_cli=None,
+        progress=_noop_progress,
+        build_create_pr=False,
+        base_branch_override=None,
+    )
+
+    assert code == 0
+    assert execute_calls == ["complete"]
+    assert wf.stage == "complete"
+    assert wf.lifecycle_status == "completed"
+
+
 def test_execute_build_through_completion_propagates_build_failed(monkeypatch, tmp_path: Path) -> None:
     def boom(run, _router, **_kw):
         raise BuildFailedError("fail", run)
@@ -527,3 +606,50 @@ class _PlanReviewSession:
 
     def step_through_sections(self, _title: str, _sections) -> StepThroughOutcome:
         return StepThroughOutcome(type=self._step_result)
+
+
+def test_run_accepted_plan_pre_build_gate_false_skips_gate(monkeypatch, tmp_path: Path) -> None:
+    gate_calls: list[int] = []
+    expected_exit_code = 42
+
+    def tracking_gate(**_kwargs):
+        gate_calls.append(1)
+        return "proceed"
+
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.gate_stage_transition", tracking_gate)
+    monkeypatch.setattr(
+        "llm_plan_execute.workflow_runner.prepare_implementation_entry",
+        lambda *_a, **_k: MagicMock(),
+    )
+
+    def fake_execute(**kwargs):
+        return kwargs["run"], expected_exit_code
+
+    monkeypatch.setattr("llm_plan_execute.workflow_runner.execute_build_through_completion", fake_execute)
+
+    runs_root = tmp_path / "runs"
+    runs_root.mkdir()
+    run = RunState.create("p", runs_root)
+    run.run_dir.mkdir(parents=True)
+    run.accepted_plan = "plan"
+    wf = WorkflowState()
+    wf.stage = "plan_review"
+    router = MagicMock()
+    router.workspace = tmp_path
+
+    _, code = run_accepted_plan(
+        run=run,
+        wf=wf,
+        router=router,
+        workspace=tmp_path,
+        runs_root=runs_root,
+        execution=ExecutionConfig(),
+        session=InteractiveSession(non_interactive=False),
+        permission_mode_cli=None,
+        progress=_noop_progress,
+        build_create_pr=False,
+        base_branch_override=None,
+        pre_build_gate=False,
+    )
+    assert gate_calls == []
+    assert code == expected_exit_code

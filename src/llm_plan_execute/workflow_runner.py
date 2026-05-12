@@ -3,8 +3,9 @@
 Command inventory
 ---------------
 
-- ``plan``: shared clarification path, planning, and typed plan review loop; stops after acceptance,
-  cancellation, or non-interactive auto-accept. Excluded from automatically chaining into build execution.
+- ``plan``: shared clarification path, planning, and typed plan review loop. Interactive acceptance
+  continues in-process into build (same pre-build gate and execution path as ``run``). Non-interactive
+  or ``--yes`` still stops after acceptance without building.
 
 - ``run``: continuous flow — clarification (optional), planning, plan review, pre-build gate, build,
   build-review decisions, and completion reporting.
@@ -34,6 +35,7 @@ from .config import ExecutionConfig, normalize_writable_dirs
 from .context_store import ContextStore
 from .git_flow import GitFlowError, commit_checkpoint, find_git_root, git_changed_pathspecs, maybe_offer_github_pr
 from .html_report import deterministic_html_report_path, write_html_report
+from .implementation_hooks import prepare_implementation_entry
 from .interactive import (
     BuildReviewDecision,
     ChoiceOption,
@@ -60,6 +62,9 @@ from .workflow_state import WorkflowState, can_transition, save_workflow_state, 
 
 ProgressHook = Callable[..., None]
 _REPORT_MARKDOWN_FILENAME = "report.md"
+
+# Exit code when the user pauses before build (same as CLI ``PAUSED_EXIT_CODE``).
+WORKFLOW_PAUSED_EXIT_CODE = 3
 
 
 def merge_execution_dirs(workspace: Path, execution: ExecutionConfig, extra_dirs: list[Path]) -> ExecutionConfig:
@@ -511,6 +516,63 @@ def execute_build_through_completion(
         create_pr_without_prompt=build_create_pr,
     )
     return _finish_build_completion(run=run, wf=wf, session=session)
+
+
+def run_accepted_plan(
+    *,
+    run: RunState,
+    wf: WorkflowState,
+    router: ProviderRouter,
+    workspace: Path,
+    runs_root: Path,
+    execution: ExecutionConfig,
+    session: InteractiveSession,
+    permission_mode_cli: str | None,
+    progress: ProgressHook,
+    build_create_pr: bool,
+    base_branch_override: str | None,
+    pre_build_gate: bool = True,
+) -> tuple[RunState, int]:
+    """Prepare workspace entry, optionally prompt before build, then run build through completion.
+
+    Shared by ``run`` after plan acceptance, interactive ``plan`` after acceptance, and
+    ``accept --build`` (with ``pre_build_gate=False`` when the user already chose to build).
+    """
+    prepare_implementation_entry(
+        workspace,
+        wf,
+        run,
+        base_branch_override=base_branch_override,
+    )
+    save_workflow_state(run.run_dir, wf)
+    if wf.stage != "pre_build" and can_transition(wf.stage, "pre_build"):
+        transition_stage(wf, "pre_build")
+        save_workflow_state(run.run_dir, wf)
+
+    if pre_build_gate and not session.non_interactive and wf.stage == "pre_build":
+        transition = gate_stage_transition(session=session, wf=wf, run=run)
+        if transition == "pause":
+            state_path = save_workflow_state(run.run_dir, wf)
+            print("Workflow paused; state preserved.")
+            print(f"Workflow state: {state_path}")
+            print(f"Continue with: llm-plan-execute build --run-dir {run.run_dir}")
+            print(f"Report: {run.run_dir / _REPORT_MARKDOWN_FILENAME}")
+            return run, WORKFLOW_PAUSED_EXIT_CODE
+        if transition == "cancel":
+            print(f"Report: {run.run_dir / _REPORT_MARKDOWN_FILENAME}")
+            return run, 130
+
+    return execute_build_through_completion(
+        run=run,
+        wf=wf,
+        router=router,
+        execution=execution,
+        session=session,
+        permission_mode_cli=permission_mode_cli,
+        progress=progress,
+        runs_root=runs_root,
+        build_create_pr=build_create_pr,
+    )
 
 
 def _run_build_stage(

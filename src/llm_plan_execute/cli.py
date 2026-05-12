@@ -44,6 +44,7 @@ from .types import (
 from .workflow import accept_plan, run_planning
 from .workflow_runner import (
     PLAN_PERMISSION_FALLBACK_WARNING,
+    WORKFLOW_PAUSED_EXIT_CODE,
     execute_build_through_completion,
     gate_stage_transition,
     interactive_plan_review,
@@ -51,6 +52,7 @@ from .workflow_runner import (
     merge_execution_dirs,
     orchestrate_clarification,
     plan_permission_workspace_write_fallback_applies,
+    run_accepted_plan,
 )
 from .workflow_state import (
     WorkflowState,
@@ -146,7 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-PAUSED_EXIT_CODE = 3
+PAUSED_EXIT_CODE = WORKFLOW_PAUSED_EXIT_CODE
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -399,7 +401,6 @@ def _plan_print_run_and_proposed_hints(
         proposed_hint = run.run_dir / "04-proposed-plan.md"
         if proposed_hint.exists():
             print(f"Proposed plan: {proposed_hint}")
-            print(f"Accept with: llm-plan-execute accept --run-dir {run.run_dir}")
 
 
 def _plan_finish_accept_or_review(
@@ -408,6 +409,7 @@ def _plan_finish_accept_or_review(
     run: RunState,
     wf: WorkflowState,
     router: ProviderRouter,
+    app_config: AppConfig,
     execution,
     progress: ProgressReporter,
 ) -> int:
@@ -433,8 +435,20 @@ def _plan_finish_accept_or_review(
         print(f"Report: {run.run_dir / 'report.md'}")
         return 130
     print(f"Accepted plan: {reviewed.run_dir / '04-accepted-plan.md'}")
-    print(f"Report: {reviewed.run_dir / 'report.md'}")
-    return 0
+    _, exit_code = run_accepted_plan(
+        run=reviewed,
+        wf=wf,
+        router=router,
+        workspace=app_config.workspace,
+        runs_root=app_config.runs_dir,
+        execution=execution,
+        session=session,
+        permission_mode_cli=args.permission_mode,
+        progress=progress.update,
+        build_create_pr=app_config.build.create_pr,
+        base_branch_override=app_config.build.base_branch,
+    )
+    return exit_code
 
 
 def _cmd_plan(
@@ -455,7 +469,7 @@ def _cmd_plan(
         return planned
     run = planned
     _plan_print_run_and_proposed_hints(args, session, run)
-    return _plan_finish_accept_or_review(args, session, run, wf, router, execution, progress)
+    return _plan_finish_accept_or_review(args, session, run, wf, router, app_config, execution, progress)
 
 
 def _run_planning_once(
@@ -546,7 +560,6 @@ def _run_accept_plan_phase(
     run: RunState,
     wf: WorkflowState,
     router: ProviderRouter,
-    app_config: AppConfig,
     execution,
     permission_mode: str | None,
     progress: ProgressReporter,
@@ -554,14 +567,6 @@ def _run_accept_plan_phase(
     if session.non_interactive:
         accept_plan(run)
         wf.touch_accepted_plan()
-        prepare_implementation_entry(
-            app_config.workspace,
-            wf,
-            run,
-            base_branch_override=app_config.build.base_branch,
-        )
-        save_workflow_state(run.run_dir, wf)
-        transition_stage(wf, "pre_build")
         save_workflow_state(run.run_dir, wf)
         return run
     reviewed = interactive_plan_review(
@@ -576,61 +581,7 @@ def _run_accept_plan_phase(
     if reviewed is None:
         print(f"Report: {run.run_dir / 'report.md'}")
         return 130
-    prepare_implementation_entry(
-        app_config.workspace,
-        wf,
-        reviewed,
-        base_branch_override=app_config.build.base_branch,
-    )
-    save_workflow_state(reviewed.run_dir, wf)
-    transition_stage(wf, "pre_build")
-    save_workflow_state(reviewed.run_dir, wf)
     return reviewed
-
-
-def _run_gate_before_build(
-    session: InteractiveSession,
-    wf: WorkflowState,
-    run: RunState,
-) -> int | None:
-    if session.non_interactive:
-        return None
-    transition = gate_stage_transition(session=session, wf=wf, run=run)
-    if transition == "pause":
-        state_path = save_workflow_state(run.run_dir, wf)
-        print("Workflow paused; state preserved.")
-        print(f"Workflow state: {state_path}")
-        print(f"Continue with: llm-plan-execute build --run-dir {run.run_dir}")
-        print(f"Report: {run.run_dir / 'report.md'}")
-        return PAUSED_EXIT_CODE
-    if transition == "cancel":
-        print(f"Report: {run.run_dir / 'report.md'}")
-        return 130
-    return None
-
-
-def _run_build_review_completion(
-    args: argparse.Namespace,
-    session: InteractiveSession,
-    router: ProviderRouter,
-    app_config: AppConfig,
-    execution,
-    wf: WorkflowState,
-    run: RunState,
-    progress: ProgressReporter,
-) -> int:
-    _, exit_code = execute_build_through_completion(
-        run=run,
-        wf=wf,
-        router=router,
-        execution=execution,
-        session=session,
-        permission_mode_cli=args.permission_mode,
-        progress=progress.update,
-        runs_root=app_config.runs_dir,
-        build_create_pr=app_config.build.create_pr,
-    )
-    return exit_code
 
 
 def _cmd_run(
@@ -656,7 +607,6 @@ def _cmd_run(
         run,
         wf,
         router,
-        app_config,
         execution,
         args.permission_mode,
         progress,
@@ -664,10 +614,20 @@ def _cmd_run(
     if isinstance(accepted, int):
         return accepted
     run = accepted
-    early = _run_gate_before_build(session, wf, run)
-    if early is not None:
-        return early
-    return _run_build_review_completion(args, session, router, app_config, execution, wf, run, progress)
+    _, exit_code = run_accepted_plan(
+        run=run,
+        wf=wf,
+        router=router,
+        workspace=app_config.workspace,
+        runs_root=app_config.runs_dir,
+        execution=execution,
+        session=session,
+        permission_mode_cli=args.permission_mode,
+        progress=progress.update,
+        build_create_pr=app_config.build.create_pr,
+        base_branch_override=app_config.build.base_branch,
+    )
+    return exit_code
 
 
 def _cmd_accept(
@@ -722,26 +682,19 @@ def _continue_build_after_accept(
         lock_acquired = True
         run._last_local_progress = "preparing workspace, context store, and task branch"  # type: ignore[attr-defined]
         progress.update("local", "workflow", run, None, None, None)
-        prepare_implementation_entry(
-            app_config.workspace,
-            wf,
-            run,
-            base_branch_override=app_config.build.base_branch,
-        )
-        save_workflow_state(run.run_dir, wf)
-        if wf.stage not in {"pre_build", "build", "build_review"}:
-            transition_stage(wf, "pre_build")
-            save_workflow_state(run.run_dir, wf)
-        _, exit_code = execute_build_through_completion(
+        _, exit_code = run_accepted_plan(
             run=run,
             wf=wf,
             router=router,
+            workspace=app_config.workspace,
+            runs_root=app_config.runs_dir,
             execution=execution,
             session=session,
             permission_mode_cli=args.permission_mode,
             progress=progress.update,
-            runs_root=app_config.runs_dir,
             build_create_pr=app_config.build.create_pr,
+            base_branch_override=app_config.build.base_branch,
+            pre_build_gate=False,
         )
         return exit_code
     finally:
