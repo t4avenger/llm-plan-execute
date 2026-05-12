@@ -280,21 +280,27 @@ def test_dry_run_allows_empty_provider_list(tmp_path, capsys):
     assert "dry-codex:frontier-planner" in captured.out
 
 
-def test_plan_without_clarify_prints_accept_command(tmp_path, capsys, monkeypatch):
+def _stdin_plan_accept_through_completion() -> tuple[str, ...]:
+    """Interactive plan accept, proceed past pre-build gate, builder permission, build review, completion."""
+    return ("1", "1", "2", "4", "4")
+
+
+def test_plan_interactive_accept_chains_build_without_accept_handoff(tmp_path, capsys, monkeypatch):
     config = _write_dry_config(tmp_path)
-    _scripted_tty_stdin(monkeypatch, "1")
+    _scripted_tty_stdin(monkeypatch, *_stdin_plan_accept_through_completion())
 
     exit_code = main([*_config_args(tmp_path, config), "plan", "--prompt", "Add a small feature", "--no-clarify"])
 
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "Proposed plan:" in captured.out
-    assert "llm-plan-execute accept --run-dir" in captured.out
+    assert "llm-plan-execute accept --run-dir" not in captured.out
+    assert "Build output:" in captured.out
 
 
 def test_plan_prints_clear_clarification_status(tmp_path, capsys, monkeypatch):
     config = _write_dry_config(tmp_path)
-    _scripted_tty_stdin(monkeypatch, "1")
+    _scripted_tty_stdin(monkeypatch, *_stdin_plan_accept_through_completion())
 
     exit_code = main([*_config_args(tmp_path, config), "plan", "--prompt", "Add a small feature"])
 
@@ -302,6 +308,23 @@ def test_plan_prints_clear_clarification_status(tmp_path, capsys, monkeypatch):
     assert exit_code == 0
     assert "Clarification: no questions required" in captured.out
     assert "Proposed plan:" in captured.out
+
+
+def test_plan_interactive_pause_before_build_preserves_state(tmp_path, capsys, monkeypatch):
+    config = _write_dry_config(tmp_path)
+    _scripted_tty_stdin(monkeypatch, "1", "2")
+
+    exit_code = main([*_config_args(tmp_path, config), "plan", "--prompt", "Add a small feature", "--no-clarify"])
+
+    captured = capsys.readouterr()
+    assert exit_code == PAUSED_EXIT
+    assert "Workflow paused" in captured.out
+    assert "Continue with: llm-plan-execute build --run-dir" in captured.out
+    assert "llm-plan-execute accept --run-dir" not in captured.out
+    run_line = next(line for line in captured.out.splitlines() if line.startswith("Run:"))
+    run_dir = tmp_path / "runs" / run_line.partition(":")[2].strip()
+    assert (run_dir / "04-accepted-plan.md").exists()
+    assert not (run_dir / "05-build-output.md").exists()
 
 
 def test_accept_command_promotes_plan(tmp_path, capsys, monkeypatch):
@@ -340,7 +363,7 @@ def test_noninteractive_clarification_exits_before_plan(tmp_path, capsys, monkey
 def test_interactive_clarification_marks_answered_questions_clear(tmp_path, capsys, monkeypatch):
     config = _write_dry_config(tmp_path)
     monkeypatch.setattr("builtins.input", lambda _prompt: "Implement the requested behavior.")
-    _scripted_tty_stdin(monkeypatch, "1")
+    _scripted_tty_stdin(monkeypatch, *_stdin_plan_accept_through_completion())
 
     exit_code = main([*_config_args(tmp_path, config), "plan", "--prompt", "Do an ambiguous thing"])
 
@@ -435,7 +458,7 @@ def test_run_cancel_stops_before_build(tmp_path, capsys, monkeypatch):
 
 def test_quiet_suppresses_progress(tmp_path, capsys, monkeypatch):
     config = _write_dry_config(tmp_path)
-    _scripted_tty_stdin(monkeypatch, "1")
+    _scripted_tty_stdin(monkeypatch, *_stdin_plan_accept_through_completion())
 
     exit_code = main(
         [*_config_args(tmp_path, config), "--quiet", "plan", "--prompt", "Add a small feature", "--no-clarify"]
@@ -449,7 +472,7 @@ def test_quiet_suppresses_progress(tmp_path, capsys, monkeypatch):
 
 def test_progress_uses_stderr_and_leaves_stdout_clean(tmp_path, capsys, monkeypatch):
     config = _write_dry_config(tmp_path)
-    _scripted_tty_stdin(monkeypatch, "1")
+    _scripted_tty_stdin(monkeypatch, *_stdin_plan_accept_through_completion())
 
     exit_code = main([*_config_args(tmp_path, config), "plan", "--prompt", "Add a small feature", "--no-clarify"])
 
@@ -462,7 +485,7 @@ def test_progress_uses_stderr_and_leaves_stdout_clean(tmp_path, capsys, monkeypa
 
 def test_progress_jsonl_outputs_structured_progress(tmp_path, capsys, monkeypatch):
     config = _write_dry_config(tmp_path)
-    _scripted_tty_stdin(monkeypatch, "1")
+    _scripted_tty_stdin(monkeypatch, *_stdin_plan_accept_through_completion())
 
     exit_code = main(
         [*_config_args(tmp_path, config), "--ui", "jsonl", "plan", "--prompt", "Add a small feature", "--no-clarify"]
