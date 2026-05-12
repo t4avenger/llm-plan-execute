@@ -75,6 +75,66 @@ def merge_execution_dirs(workspace: Path, execution: ExecutionConfig, extra_dirs
     )
 
 
+_PLANNING_PERMISSION_PHASE_ROLES = frozenset(
+    {"clarifier", "planner", "plan_reviewer_a", "plan_reviewer_b", "plan_arbiter"}
+)
+
+_PERMISSION_MODE_RANK: dict[str, int] = {"read-only": 0, "workspace-write": 1, "full-access": 2}
+
+PLAN_PERMISSION_FALLBACK_WARNING = (
+    "Warning: planning requires workspace file and command access. "
+    "Retrying with minimum workspace-write permission enabled."
+)
+
+
+def is_planning_permission_failure_message(text: str) -> bool:
+    """True when *text* looks like a sandbox or permission denial from a planning-phase provider."""
+    lower = text.lower()
+    direct_matches = (
+        "permission denied",
+        "eacces",
+        "operation not permitted",
+        "cannot execute",
+        "unable to execute",
+    )
+    paired_matches = (
+        ("eperm", ("operation",)),
+        ("not allowed", ("read", "file", "path", "command", "shell", "exec")),
+        ("sandbox", ("denied", "blocked", "forbidden", "restricted", "not allowed", "read-only")),
+        ("read-only", ("sandbox", "filesystem")),
+        ("blocked by", ("policy",)),
+    )
+    return any(token in lower for token in direct_matches) or any(
+        lead in lower and any(token in lower for token in tokens) for lead, tokens in paired_matches
+    )
+
+
+def is_run_planning_permission_failure(run: RunState) -> bool:
+    return any(
+        result.role in _PLANNING_PERMISSION_PHASE_ROLES
+        and result.error
+        and is_planning_permission_failure_message(result.error)
+        for result in run.results
+    )
+
+
+def plan_permission_workspace_write_fallback_applies(
+    execution: ExecutionConfig, *, permission_mode_cli: str | None, no_clarify: bool
+) -> bool:
+    """Whether an automatic workspace-write retry is allowed (implicit modes only, not already elevated)."""
+    if permission_mode_cli is not None:
+        return False
+    roles: tuple[str, ...] = ("planner", "plan_reviewer_a", "plan_reviewer_b", "plan_arbiter")
+    if not no_clarify:
+        roles = ("clarifier", *roles)
+    write_rank = _PERMISSION_MODE_RANK["workspace-write"]
+    for role in roles:
+        mode = execution.mode_for_role(role)
+        if _PERMISSION_MODE_RANK.get(mode, 0) < write_rank:
+            return True
+    return False
+
+
 def orchestrate_clarification(
     *,
     prompt: str,
