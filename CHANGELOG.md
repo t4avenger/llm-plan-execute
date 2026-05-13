@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Bare `llm-plan-execute` on a TTY now launches an interactive wizard that confirms the workspace, manages project-local `.llm-plan-execute/config.json` (use existing / reconfigure / validate / create), detects paused runs to resume, and prompts for the task text (inline or via `$EDITOR`). On non-TTY or with `--non-interactive`, the bare command prints help and exits nonzero. Existing subcommands and automation are unchanged.
+- Add `--reconfigure` flag (wizard-only) to rerun provider/model setup even when a config already exists.
+
 ## 0.3.0
 
 - Fix `_cmd_build` to acquire the session lock **before** mutating workflow state, preventing race conditions and stage clobbers on resume.

@@ -41,6 +41,7 @@ from .types import (
     RunState,
     Usage,
 )
+from .wizard import is_tty, run_wizard
 from .workflow import accept_plan, run_planning
 from .workflow_runner import (
     PLAN_PERMISSION_FALLBACK_WARNING,
@@ -89,7 +90,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use deterministic defaults for menus (also implied when stdin is not a TTY).",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "--reconfigure",
+        action="store_true",
+        help="In wizard mode, rerun provider/model setup even when a config exists.",
+    )
+    sub = parser.add_subparsers(dest="command", required=False)
 
     init = sub.add_parser("init-config", help="Write a sample local config.")
     init.add_argument("--path", type=Path, default=DEFAULT_CONFIG)
@@ -152,22 +158,17 @@ PAUSED_EXIT_CODE = WORKFLOW_PAUSED_EXIT_CODE
 
 
 def main(argv: list[str] | None = None) -> int:
-    try:
-        return _run(argv)
-    except InteractiveCanceledError:
-        print("Workflow canceled.", file=sys.stderr)
-        return 130
-    except GitFlowError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-    except (KeyError, OSError, TypeError, ValueError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+    """CLI entry used by ``python -m`` and console scripts."""
+    return _invoke_run_with_cli_exit_mapping(argv)
 
 
 def _run(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     workspace = resolve_repo(args.repo)
+
+    if args.command is None:
+        return _handle_no_command(args, workspace, parser)
 
     if args.command == "init-config":
         return _cmd_init_config(args, workspace)
@@ -183,6 +184,42 @@ def _run(argv: list[str] | None = None) -> int:
     progress = ProgressReporter(enabled=not args.quiet, verbose=args.verbose, stream=sys.stderr, ui=args.ui)
 
     return _dispatch_command(args, router, app_config, progress)
+
+
+def _invoke_run_with_cli_exit_mapping(argv: list[str] | None = None) -> int:
+    try:
+        return _run(argv)
+    except InteractiveCanceledError:
+        print("Workflow canceled.", file=sys.stderr)
+        return 130
+    except GitFlowError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+def dispatch_argv(argv: list[str] | None = None) -> int:
+    """Run the CLI with ``argv``-style arguments (wizard hand-off, programmatic use, tests).
+
+    Tests may replace this name on ``llm_plan_execute.cli`` to intercept wizard sub-invocations
+    without affecting :func:`main`, which shares behavior via :func:`_invoke_run_with_cli_exit_mapping`.
+    """
+    return _invoke_run_with_cli_exit_mapping(argv)
+
+
+def _handle_no_command(
+    args: argparse.Namespace,
+    workspace: Path,
+    parser: argparse.ArgumentParser,
+) -> int:
+    """Launch the interactive wizard on a TTY, otherwise print help and exit nonzero."""
+    if args.non_interactive or not is_tty(sys.stdin):
+        parser.print_help(sys.stderr)
+        print("\nNo subcommand provided; pass --help or a subcommand.", file=sys.stderr)
+        return 1
+    return run_wizard(args, workspace)
 
 
 def _dispatch_command(
