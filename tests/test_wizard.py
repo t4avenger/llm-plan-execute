@@ -11,7 +11,7 @@ import pytest
 
 from llm_plan_execute import wizard
 from llm_plan_execute.cli import main
-from llm_plan_execute.config import DEFAULT_ROOT
+from llm_plan_execute.config import DEFAULT_ROOT, MAX_SCORE, MIN_SCORE
 
 CANCELED_EXIT = 130
 
@@ -61,6 +61,18 @@ def _paused_run(workspace: Path, name: str = "20260101-000000-deadbeef") -> Path
     }
     (runs_dir / "workflow-state.json").write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
     return runs_dir
+
+
+class _ScriptedSession:
+    def __init__(self, *, confirms: list[bool] | None = None, texts: list[str] | None = None) -> None:
+        self.confirms = confirms or []
+        self.texts = texts or []
+
+    def prompt_confirm(self, *_args: object, **_kwargs: object) -> bool:
+        return self.confirms.pop(0)
+
+    def prompt_free_text(self, *_args: object, **_kwargs: object) -> str:
+        return self.texts.pop(0)
 
 
 def test_is_tty_handles_streams_without_isatty() -> None:
@@ -617,6 +629,86 @@ def test_wizard_paused_scan_warns_on_newer_schema_but_lists_readable_paused(
     assert captured_argv
     assert "build" in captured_argv[-1]
     assert str(good) in captured_argv[-1]
+
+
+def test_wizard_paused_scan_rejects_runs_dir_outside_workspace(tmp_path: Path) -> None:
+    config = tmp_path / DEFAULT_ROOT / "config.json"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        json.dumps({"dry_run": True, "runs_dir": str(tmp_path.parent), "providers": []}) + "\n",
+        encoding="utf-8",
+    )
+
+    scan = wizard._find_paused_runs(tmp_path, None)
+
+    assert scan.paused == ()
+    assert len(scan.warnings) == 1
+    assert "invalid runs_dir" in scan.warnings[0]
+    assert str(tmp_path / DEFAULT_ROOT / "runs") in scan.warnings[0]
+
+
+def test_wizard_parse_scores_uses_config_score_bounds() -> None:
+    assert wizard._parse_scores([str(MIN_SCORE), str(MAX_SCORE), "3", "4"]) == [MIN_SCORE, MAX_SCORE, 3, 4]
+    assert wizard._parse_scores([str(MIN_SCORE - 1), "3", "3", "3"]) is None
+    assert wizard._parse_scores([str(MAX_SCORE + 1), "3", "3", "3"]) is None
+
+
+def test_wizard_interactive_edit_provider_updates_enabled_model(capsys: pytest.CaptureFixture[str]) -> None:
+    provider: dict[str, object] = {
+        "name": "codex",
+        "command": "codex",
+        "enabled": False,
+        "models": [{"name": "old", "roles": ["builder"], "reasoning": 3, "speed": 3, "cost": 3, "context": 3}],
+    }
+    session = _ScriptedSession(
+        confirms=[True],
+        texts=[
+            "codex --profile review",
+            "new-model",
+            "builder,not_a_role",
+            "5 4 3 2",
+        ],
+    )
+
+    wizard._interactive_edit_provider(session, provider, 0)
+
+    err = capsys.readouterr().err
+    assert "Ignoring unknown roles: not_a_role" in err
+    assert provider["enabled"] is True
+    assert provider["command"] == "codex --profile review"
+    model = provider["models"][0]
+    assert model["name"] == "new-model"
+    assert model["roles"] == ["builder"]
+    assert [model[field] for field in ("reasoning", "speed", "cost", "context")] == [5, 4, 3, 2]
+
+
+def test_wizard_interactive_edit_model_scores_keeps_previous_on_bad_input(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    model: dict[str, object] = {"reasoning": 1, "speed": 2, "cost": 3, "context": 4}
+
+    wizard._interactive_edit_model_scores(_ScriptedSession(texts=["1 2 3"]), model)
+    wizard._interactive_edit_model_scores(_ScriptedSession(texts=["1 2 3 nope"]), model)
+
+    err = capsys.readouterr().err
+    assert "Expected 4 integers" in err
+    assert "Invalid scores" in err
+    assert model == {"reasoning": 1, "speed": 2, "cost": 3, "context": 4}
+
+
+def test_wizard_helpers_handle_unexpected_provider_shapes() -> None:
+    raw: dict[str, object] = {"providers": "not-a-list"}
+    wizard._interactive_edit_providers(_ScriptedSession(), raw)
+    assert wizard._enabled_provider_summary(raw) == ""
+
+    raw["providers"] = [
+        "bad",
+        {"enabled": True},
+        {"name": "zeta", "enabled": True},
+        {"name": "alpha", "enabled": True},
+        {"name": "disabled", "enabled": False},
+    ]
+    assert wizard._enabled_provider_summary(raw) == "alpha, zeta"
 
 
 def test_wizard_editor_decline_prompt_loops_back_to_entry_menu(

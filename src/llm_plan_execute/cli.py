@@ -41,6 +41,7 @@ from .types import (
     RunState,
     Usage,
 )
+from .wizard import is_tty, run_wizard
 from .workflow import accept_plan, run_planning
 from .workflow_runner import (
     PLAN_PERMISSION_FALLBACK_WARNING,
@@ -214,8 +215,6 @@ def _handle_no_command(
     parser: argparse.ArgumentParser,
 ) -> int:
     """Launch the interactive wizard on a TTY, otherwise print help and exit nonzero."""
-    from .wizard import is_tty, run_wizard
-
     if args.non_interactive or not is_tty(sys.stdin):
         parser.print_help(sys.stderr)
         print("\nNo subcommand provided; pass --help or a subcommand.", file=sys.stderr)

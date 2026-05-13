@@ -27,9 +27,12 @@ from pathlib import Path
 
 from .config import (
     DEFAULT_ROOT,
+    MAX_SCORE,
+    MIN_SCORE,
     SCORE_FIELDS,
     ConfigValidation,
     format_validation,
+    normalize_runs_dir,
     resolve_config_path,
     sample_config,
     validate_config_data,
@@ -52,8 +55,6 @@ WIZARD_ROLE_HELP = (
     "  builder, build_reviewer_a, build_reviewer_b, build_arbiter"
 )
 DEFAULT_SCORE = 3
-MIN_SCORE = 1
-MAX_SCORE = 5
 
 
 @dataclass(frozen=True)
@@ -371,11 +372,11 @@ def _print_validation(args: argparse.Namespace, workspace: Path) -> int:
 
 
 def _find_paused_runs(workspace: Path, config_arg: Path | None) -> PausedRunScan:
-    runs_dir = _resolve_runs_dir(workspace, config_arg)
+    runs_dir, runs_dir_warning = _resolve_runs_dir(workspace, config_arg)
+    warnings = [runs_dir_warning] if runs_dir_warning else []
     if not runs_dir.exists():
-        return PausedRunScan((), ())
+        return PausedRunScan((), tuple(warnings))
     paused: list[Path] = []
-    warnings: list[str] = []
     for candidate in sorted(runs_dir.iterdir(), reverse=True):
         if not candidate.is_dir():
             continue
@@ -410,7 +411,8 @@ def _load_paused_candidate(candidate: Path) -> tuple[WorkflowState, None] | tupl
         return None, f"Warning: skipped paused-run candidate {candidate.name}: unreadable workflow state ({exc})."
 
 
-def _resolve_runs_dir(workspace: Path, config_arg: Path | None) -> Path:
+def _resolve_runs_dir(workspace: Path, config_arg: Path | None) -> tuple[Path, str | None]:
+    fallback = (workspace / DEFAULT_ROOT / "runs").resolve()
     config_path = resolve_config_path(config_arg, workspace)
     if config_path.exists():
         try:
@@ -419,9 +421,12 @@ def _resolve_runs_dir(workspace: Path, config_arg: Path | None) -> Path:
             raw = {}
         candidate = raw.get("runs_dir") if isinstance(raw, dict) else None
         if isinstance(candidate, str) and candidate:
-            path = Path(candidate)
-            return path if path.is_absolute() else (workspace / path)
-    return workspace / DEFAULT_ROOT / "runs"
+            try:
+                return normalize_runs_dir(workspace, Path(candidate)), None
+            except (OSError, ValueError) as exc:
+                warning = f"Warning: invalid runs_dir in {config_path}: {exc}; using {fallback}."
+                return fallback, warning
+    return fallback, None
 
 
 def _ask_paused_action(session: InteractiveSession, paused: Sequence[Path]) -> str:
