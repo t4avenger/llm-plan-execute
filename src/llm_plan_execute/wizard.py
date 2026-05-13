@@ -481,7 +481,8 @@ def _read_prompt_from_editor(session: InteractiveSession) -> str:
     try:
         argv = _editor_argv(editor, path)
         try:
-            completed = subprocess.run(argv, check=False)  # noqa: S603 - argv form, no shell
+            # The editor command is split into argv form and executed without a shell.
+            completed = subprocess.run(argv, check=False)  # noqa: S603
         except OSError as exc:
             print(f"Failed to launch $EDITOR ({editor}): {exc}", file=sys.stderr)
             return ""
