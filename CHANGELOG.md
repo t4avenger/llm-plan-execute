@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.0
+
+- Release notes pending.
+
 ## Unreleased
 
 - Bare `llm-plan-execute` on a TTY now launches an interactive wizard that confirms the workspace, manages project-local `.llm-plan-execute/config.json` (use existing / reconfigure / validate / create), detects paused runs to resume, and prompts for the task text (inline or via `$EDITOR`). On non-TTY or with `--non-interactive`, the bare command prints help and exits nonzero. Existing subcommands and automation are unchanged.
